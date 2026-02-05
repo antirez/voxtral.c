@@ -245,9 +245,10 @@ int vox_stream_finish(vox_stream_t *s);
  * Returns number of tokens written (0 = nothing pending). */
 int vox_stream_get(vox_stream_t *s, const char **out_tokens, int max);
 
-/* Set minimum processing interval in seconds. When set, feed() accumulates
- * audio but only runs the encoder/decoder after at least this many seconds
- * of new audio have been fed. 0 = process on every feed() (default).
+/* Set minimum time between encoder runs, in seconds.
+ * Lower = more responsive streaming (higher GPU overhead).
+ * Higher = more efficient batching (higher latency).
+ * Default: 2.0. First chunk always waits for ~3s (decoder prompt needs 312 mel).
  * finish() always processes all remaining data regardless. */
 void vox_set_processing_interval(vox_stream_t *s, float seconds);
 

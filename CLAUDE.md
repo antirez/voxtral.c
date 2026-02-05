@@ -48,6 +48,18 @@ MODEL.md                    - Architecture & weight format reference
 vllm/                       - Upstream vLLM clone (official reference)
 ```
 
+## Streaming Architecture
+
+The encoder uses an incremental KV cache (same as the decoder). Audio is processed
+in chunks: conv stem tail buffers handle boundary correctness, and the encoder
+transformer only processes new positions against cached K/V. Rolling compaction
+at window=750 keeps memory bounded.
+
+`vox_set_processing_interval(s, seconds)` controls how often the encoder triggers.
+Default: 2.0s. Lower = more responsive (higher GPU overhead), higher = more efficient
+batching (higher latency). For offline file transcription the interval is irrelevant
+since all audio is available at once.
+
 ## Architecture
 
 See MODEL.md for full architecture details, weight tensor names, tokenizer layout, and decode schedule.

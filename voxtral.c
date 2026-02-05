@@ -312,10 +312,11 @@ void vox_free(vox_ctx_t *ctx) {
 #define RAW_AUDIO_LENGTH_PER_TOK 1280
 #define OFFLINE_STREAMING_BUFFER_TOKENS 10
 
-/* Minimum new mel frames per incremental encoder run (~5 seconds of audio) */
-#define STREAM_MIN_NEW_MEL  500
 /* First chunk minimum mel frames (enough for 39 prompt adapter tokens) */
 #define STREAM_FIRST_CHUNK_MIN_MEL  312
+
+/* Default processing interval in seconds (mel rate = 100 fps) */
+#define STREAM_DEFAULT_INTERVAL  2.0f
 
 static void trim_ascii_whitespace(char *s) {
     if (!s) return;
@@ -385,9 +386,8 @@ struct vox_stream {
     float *step_embed;
     float *tok_tmp;
 
-    /* Processing interval: minimum samples between encoder/decoder runs */
-    int interval_samples;       /* 0 = process on every feed() */
-    int samples_since_process;
+    /* Processing interval: minimum new mel frames before encoder triggers */
+    int min_new_mel;            /* derived from interval in seconds (mel rate = 100 fps) */
 
     /* Timing */
     double encoder_ms;
@@ -576,7 +576,7 @@ static void stream_run_encoder(vox_stream_t *s) {
     int dim = VOX_DEC_DIM;
 
     int new_mel = total_mel - s->mel_cursor;
-    int need_mel = (!s->conv_stem_initialized) ? STREAM_FIRST_CHUNK_MIN_MEL : STREAM_MIN_NEW_MEL;
+    int need_mel = (!s->conv_stem_initialized) ? STREAM_FIRST_CHUNK_MIN_MEL : s->min_new_mel;
 
     if (new_mel < need_mel && !s->finished) return;
     if (new_mel <= 0) return;
@@ -802,6 +802,9 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
     ctx->enc_kv_cache_len = 0;
     ctx->enc_kv_pos_offset = 0;
 
+    /* Default processing interval: 2 seconds (200 mel frames) */
+    s->min_new_mel = (int)(STREAM_DEFAULT_INTERVAL * 100.0f);
+
     return s;
 }
 
@@ -810,14 +813,9 @@ int vox_stream_feed(vox_stream_t *s, const float *samples, int n_samples) {
 
     vox_mel_feed(s->mel_ctx, samples, n_samples);
     s->real_samples_fed += n_samples;
-    s->samples_since_process += n_samples;
 
-    if (s->interval_samples == 0 ||
-        s->samples_since_process >= s->interval_samples) {
-        stream_run_encoder(s);
-        stream_run_decoder(s);
-        s->samples_since_process = 0;
-    }
+    stream_run_encoder(s);
+    stream_run_decoder(s);
     return 0;
 }
 
@@ -1145,8 +1143,10 @@ char *vox_transcribe(vox_ctx_t *ctx, const char *wav_path) {
 
 void vox_set_processing_interval(vox_stream_t *s, float seconds) {
     if (!s) return;
-    s->interval_samples = (int)(seconds * VOX_SAMPLE_RATE);
-    if (s->interval_samples < 0) s->interval_samples = 0;
+    if (seconds <= 0) seconds = 0;
+    /* mel rate = sample_rate / hop_length = 16000/160 = 100 fps */
+    s->min_new_mel = (int)(seconds * 100.0f);
+    if (s->min_new_mel < 1) s->min_new_mel = 1;
 }
 
 void vox_set_delay(vox_ctx_t *ctx, int delay_ms) {
