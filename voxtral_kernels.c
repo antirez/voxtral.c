@@ -319,13 +319,7 @@ void vox_causal_conv1d(float *out, const float *in, const float *weight, const f
     }
 
     /* out = weight × im2col: [channels_out, K] × [K, out_length] → [channels_out, out_length] */
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                channels_out, out_length, K,
-                1.0f,
-                weight, K,
-                im2col, out_length,
-                0.0f,
-                out, out_length);
+    vox_matmul(out, weight, im2col, channels_out, K, out_length);
     free(im2col);
 
     /* Add bias */
