@@ -232,10 +232,8 @@ make avx512     # AVX-512 BF16 direct (Linux, no OpenBLAS needed)
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with AVX-512 BF16 (AMD Zen 4+, Intel Sapphire Rapids+): `make avx512`
-- Linux without AVX-512 BF16: `make blas`
-
-The `avx512` backend uses the `VDPBF16PS` instruction to multiply bf16 weights directly without conversion, eliminating the OpenBLAS dependency entirely. It requires AMD Zen 4/5 or Intel Sapphire Rapids+ CPUs. A runtime check will print an error if the CPU lacks support.
+- Linux with OpenBLAS: `make blas`
+- Linux with AVX-512 BF16: `make avx512` (For AMD Zen 4+ and Intel Sapphire Rapids+ CPUs. A runtime check will print an error if the CPU lacks support.)
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
