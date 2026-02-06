@@ -5,6 +5,7 @@
 
 #include "voxtral_kernels.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -18,6 +19,23 @@
 #else
 #include <cblas.h>
 #endif
+#endif
+
+#ifdef USE_AVX512BF16
+#include "voxtral_avx512.h"
+/* Cached runtime check: -1 = unchecked, 0 = unavailable, 1 = available */
+static int avx512bf16_detected = -1;
+static int avx512bf16_check(void) {
+    if (avx512bf16_detected == -1)
+        avx512bf16_detected = avx512bf16_available();
+    if (!avx512bf16_detected) {
+        fprintf(stderr, "FATAL: This binary was compiled with AVX-512 BF16 support,\n"
+                        "but this CPU does not support it.\n"
+                        "Required: AMD Zen 4+ or Intel Sapphire Rapids+.\n");
+        exit(1);
+    }
+    return 1;
+}
 #endif
 
 /* Minimum matrix size to use GPU */
@@ -202,6 +220,11 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         return;
     }
 #endif
+#ifdef USE_AVX512BF16
+    avx512bf16_check();
+    matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
+    return;
+#endif
     if (seq_len == 1) {
         bf16_matvec_fused(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
@@ -228,6 +251,18 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
         return;
     }
 #endif
+#ifdef USE_AVX512BF16
+    avx512bf16_check();
+    matmul_avx512bf16_tiled(y, x, W_bf16, seq_len, out_dim, in_dim);
+    if (b != NULL) {
+        for (int s = 0; s < seq_len; s++) {
+            for (int o = 0; o < out_dim; o++) {
+                y[s * out_dim + o] += b[o];
+            }
+        }
+    }
+    return;
+#endif
     if (seq_len == 1) {
         bf16_matvec_fused(y, x, W_bf16, b, in_dim, out_dim);
         return;
@@ -251,6 +286,11 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
         vox_metal_sgemm_bf16(M, N, K, A, B_bf16, C);
         return;
     }
+#endif
+#ifdef USE_AVX512BF16
+    avx512bf16_check();
+    matmul_avx512bf16_tiled(C, A, B_bf16, M, N, K);
+    return;
 #endif
     if (M == 1) {
         bf16_matvec_fused(C, A, B_bf16, NULL, K, N);

@@ -18,7 +18,7 @@ TARGET = voxtral
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas mps inspect test
+.PHONY: all clean debug info help blas mps avx512 inspect test
 
 # Default: show available targets
 all: help
@@ -32,6 +32,9 @@ ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
+endif
+ifeq ($(UNAME_S),Linux)
+	@echo "  make avx512   - AVX-512 BF16 (AMD Zen 4+/Intel SPR+, no OpenBLAS needed)"
 endif
 	@echo ""
 	@echo "Other targets:"
@@ -94,6 +97,16 @@ mps:
 endif
 
 # =============================================================================
+# Backend: avx512 (AVX-512 BF16 direct — no OpenBLAS needed)
+# Targets: AMD Zen 4/5 (znver4/znver5), Intel Sapphire Rapids+
+# =============================================================================
+avx512: CFLAGS = $(CFLAGS_BASE) -mavx512f -mavx512bf16 -fopenmp -DUSE_AVX512BF16
+avx512: LDFLAGS += -fopenmp
+avx512: clean $(TARGET)
+	@echo ""
+	@echo "Built with AVX-512 BF16 backend (no OpenBLAS dependency)"
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) main.o
@@ -124,7 +137,7 @@ test:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights test_avx512bf16_bin
 	rm -f voxtral_shaders_source.h
 
 info:
@@ -139,13 +152,14 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+	@echo "  avx512  - AVX-512 BF16 direct (AMD Zen 4+/Intel SPR+, no OpenBLAS)"
 endif
 
 # =============================================================================
 # Dependencies
 # =============================================================================
 voxtral.o: voxtral.c voxtral.h voxtral_kernels.h voxtral_safetensors.h voxtral_audio.h voxtral_tokenizer.h
-voxtral_kernels.o: voxtral_kernels.c voxtral_kernels.h
+voxtral_kernels.o: voxtral_kernels.c voxtral_kernels.h $(wildcard voxtral_avx512.h)
 voxtral_audio.o: voxtral_audio.c voxtral_audio.h
 voxtral_encoder.o: voxtral_encoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
 voxtral_decoder.o: voxtral_decoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
