@@ -395,6 +395,7 @@ struct vox_stream {
     double encoder_ms;
     double decoder_ms;
     int n_generated;
+    int n_text_tokens;          /* tokens with ID >= 1000 (visible text) */
 };
 
 static void stream_enqueue_token(vox_stream_t *s, const char *piece) {
@@ -762,7 +763,7 @@ static void stream_run_decoder(vox_stream_t *s) {
         /* Enqueue if it's a text token */
         if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
             const char *piece = vox_tokenizer_decode(s->tokenizer, s->prev_token);
-            if (piece) stream_enqueue_token(s, piece);
+            if (piece) { stream_enqueue_token(s, piece); s->n_text_tokens++; }
         }
         if (s->prev_token == TOKEN_EOS) s->eos_seen = 1;
 
@@ -793,7 +794,7 @@ static void stream_run_decoder(vox_stream_t *s) {
 
             if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
                 const char *piece = vox_tokenizer_decode(s->tokenizer, s->prev_token);
-                if (piece) stream_enqueue_token(s, piece);
+                if (piece) { stream_enqueue_token(s, piece); s->n_text_tokens++; }
             }
 
             s->gen_pos++;
@@ -915,9 +916,9 @@ void vox_stream_free(vox_stream_t *s) {
     if (vox_verbose >= 1) {
         fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
                 s->mel_cursor, s->total_adapter, s->encoder_ms);
-        if (s->n_generated > 0)
+        if (s->n_text_tokens > 0)
             fprintf(stderr, "Decoder: %d tokens in %.0f ms (%.1f ms/token)\n",
-                    s->n_generated, s->decoder_ms, s->decoder_ms / s->n_generated);
+                    s->n_text_tokens, s->decoder_ms, s->decoder_ms / s->n_text_tokens);
     }
 
     vox_mel_free(s->mel_ctx);
