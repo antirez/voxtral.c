@@ -82,14 +82,6 @@ static inline __m256i fp32x16_to_bf16(__m512 v) {
     return (__m256i)_mm512_cvtneps_pbh(v);
 }
 
-/* Convert 16 BF16 values (in a 256-bit register) to 16 FP32 values.
- * BF16 → FP32 is just shifting left by 16, which we do via integer ops. */
-static inline __m512 bf16x16_to_fp32(__m256i v) {
-    __m512i wide = _mm512_cvtepu16_epi32(v);
-    __m512i shifted = _mm512_slli_epi32(wide, 16);
-    return _mm512_castsi512_ps(shifted);
-}
-
 /* ========================================================================
  * Core Matmul Kernel: C[M×N] += A[M×K](fp32) × B^T[N×K](bf16)
  *
@@ -114,11 +106,9 @@ static inline __m512 bf16x16_to_fp32(__m256i v) {
  * ======================================================================== */
 
 /*
- * matmul_avx512bf16_tiled - Cache-friendly tiled version.
+ * matmul_avx512bf16_tiled - Cache-friendly tiled matmul.
  *
- * Same interface as matmul_avx512bf16, but tiles over N to improve
- * L2 cache reuse of the A row's BF16 conversion.
- *
+ * Tiles over N to improve L2 cache reuse of the A row's BF16 conversion.
  * For voxtral's typical shapes (K=1280 or 3072, N=1280..5120),
  * this can help keep B-tiles in L2.
  *
@@ -207,47 +197,6 @@ static void matmul_avx512bf16_tiled(
         }
     }
     #undef N_TILE
-}
-
-/* ========================================================================
- * Element-wise BF16 operations (for non-matmul kernels)
- * ======================================================================== */
-
-/* Add bias (bf16) to fp32 output: out[i] += bias[i] */
-static inline void add_bias_bf16_avx512(
-    float *restrict out,
-    const uint16_t *restrict bias,
-    int n)
-{
-    int i = 0;
-    for (; i + 15 < n; i += 16) {
-        __m256i bv = _mm256_loadu_si256((const __m256i *)(bias + i));
-        __m512 bf = bf16x16_to_fp32(bv);
-        __m512 ov = _mm512_loadu_ps(out + i);
-        _mm512_storeu_ps(out + i, _mm512_add_ps(ov, bf));
-    }
-    for (; i < n; i++) {
-        out[i] += bf16_to_fp32(bias[i]);
-    }
-}
-
-/* Scale fp32 vector by bf16 vector element-wise: out[i] = a[i] * b_bf16[i] */
-static inline void mul_bf16_avx512(
-    float *restrict out,
-    const float *restrict a,
-    const uint16_t *restrict b,
-    int n)
-{
-    int i = 0;
-    for (; i + 15 < n; i += 16) {
-        __m512 av = _mm512_loadu_ps(a + i);
-        __m256i bv = _mm256_loadu_si256((const __m256i *)(b + i));
-        __m512 bf = bf16x16_to_fp32(bv);
-        _mm512_storeu_ps(out + i, _mm512_mul_ps(av, bf));
-    }
-    for (; i < n; i++) {
-        out[i] = a[i] * bf16_to_fp32(b[i]);
-    }
 }
 
 #ifdef __cplusplus
