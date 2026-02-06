@@ -10,6 +10,7 @@ HuggingFace: `mistralai/Voxtral-Mini-4B-Realtime-2602`
 ```bash
 # Build
 make mps       # Apple Silicon (fastest)
+make avx512    # AVX-512 BF16 (AMD Zen 4+/Intel SPR+, no OpenBLAS needed)
 make blas      # CPU with BLAS (Accelerate on macOS, OpenBLAS on Linux)
 make clean
 
