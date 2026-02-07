@@ -239,6 +239,193 @@ extern "C" __global__ void vox_attn_q4_kv8_f32(float *out_q,      /* [32*128] */
     out_q[h * 128 + (lane + 3 * 32)] = out3 * inv_sum;
 }
 
+/* v2 attention kernels: same math, different per-thread layout (contiguous 4-dim
+ * chunks per lane). These are opt-in via VOX_CUDA_ATTN_V2=1. */
+
+extern "C" __global__ void vox_attn_q4_kv8_fp16_v2(float *out_q,          /* [32*128] */
+                                                   const float *q,        /* [32*128] */
+                                                   const __half *k_cache,  /* [max_seq*8*128] */
+                                                   const __half *v_cache,  /* [max_seq*8*128] */
+                                                   int total_seq,
+                                                   int window_size,
+                                                   float scale) {
+    int h = (int)blockIdx.x;     /* 0..31 */
+    int lane = (int)threadIdx.x; /* 0..31 */
+    if (h >= 32 || lane >= 32) return;
+
+    int kv_h = h >> 2; /* 4 query heads share 1 KV head */
+
+    const float4 qv = ((const float4 *)(q + h * 128))[lane];
+
+    int end = total_seq;
+    int start = 0;
+    if (window_size > 0) {
+        int s = end - window_size;
+        if (s > 0) start = s;
+    }
+    if (start < 0) start = 0;
+    if (end < start) end = start;
+
+    float max_score = -1.0e30f;
+    float sum_exp = 0.0f;
+
+    float out0 = 0.0f;
+    float out1 = 0.0f;
+    float out2 = 0.0f;
+    float out3 = 0.0f;
+
+    const __half2 *k2 = (const __half2 *)k_cache;
+    const __half2 *v2 = (const __half2 *)v_cache;
+    size_t row_stride = (size_t)(8 * 128) / 2; /* 1024 half -> 512 half2 */
+    size_t head_off = (size_t)kv_h * (size_t)128 / 2; /* 128 half -> 64 half2 */
+    int off2 = lane * 2;
+
+    for (int j = start; j < end; j++) {
+        const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
+        float2 k01 = __half22float2(k_row[off2 + 0]);
+        float2 k23 = __half22float2(k_row[off2 + 1]);
+
+        float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
+        float sum = warp_reduce_sum(partial);
+        sum = __shfl_sync(0xffffffff, sum, 0);
+        float score = sum * scale;
+
+        float w = 0.0f;
+        float corr = 1.0f;
+        int new_max = 0;
+        if (lane == 0) {
+            if (score > max_score) {
+                corr = __expf(max_score - score);
+                sum_exp = sum_exp * corr + 1.0f;
+                max_score = score;
+                w = 1.0f;
+                new_max = 1;
+            } else {
+                w = __expf(score - max_score);
+                sum_exp += w;
+                corr = 1.0f;
+                new_max = 0;
+            }
+        }
+        w = __shfl_sync(0xffffffff, w, 0);
+        corr = __shfl_sync(0xffffffff, corr, 0);
+        new_max = __shfl_sync(0xffffffff, new_max, 0);
+
+        const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
+        float2 v01 = __half22float2(v_row[off2 + 0]);
+        float2 v23 = __half22float2(v_row[off2 + 1]);
+
+        if (new_max) {
+            out0 = out0 * corr + v01.x;
+            out1 = out1 * corr + v01.y;
+            out2 = out2 * corr + v23.x;
+            out3 = out3 * corr + v23.y;
+        } else {
+            out0 += w * v01.x;
+            out1 += w * v01.y;
+            out2 += w * v23.x;
+            out3 += w * v23.y;
+        }
+    }
+
+    float inv_sum = 0.0f;
+    if (lane == 0) inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    inv_sum = __shfl_sync(0xffffffff, inv_sum, 0);
+
+    ((float4 *)(out_q + h * 128))[lane] = make_float4(out0 * inv_sum,
+                                                      out1 * inv_sum,
+                                                      out2 * inv_sum,
+                                                      out3 * inv_sum);
+}
+
+extern "C" __global__ void vox_attn_q4_kv8_f32_v2(float *out_q,      /* [32*128] */
+                                                  const float *q,    /* [32*128] */
+                                                  const float *k_cache, /* [max_seq*8*128] */
+                                                  const float *v_cache, /* [max_seq*8*128] */
+                                                  int total_seq,
+                                                  int window_size,
+                                                  float scale) {
+    int h = (int)blockIdx.x;     /* 0..31 */
+    int lane = (int)threadIdx.x; /* 0..31 */
+    if (h >= 32 || lane >= 32) return;
+
+    int kv_h = h >> 2;
+
+    const float4 qv = ((const float4 *)(q + h * 128))[lane];
+
+    int end = total_seq;
+    int start = 0;
+    if (window_size > 0) {
+        int s = end - window_size;
+        if (s > 0) start = s;
+    }
+    if (start < 0) start = 0;
+    if (end < start) end = start;
+
+    float max_score = -1.0e30f;
+    float sum_exp = 0.0f;
+
+    float out0 = 0.0f;
+    float out1 = 0.0f;
+    float out2 = 0.0f;
+    float out3 = 0.0f;
+
+    for (int j = start; j < end; j++) {
+        const float *k_head = k_cache + ((size_t)j * 8 + (size_t)kv_h) * 128;
+        const float4 k4 = ((const float4 *)k_head)[lane];
+
+        float partial = qv.x * k4.x + qv.y * k4.y + qv.z * k4.z + qv.w * k4.w;
+        float sum = warp_reduce_sum(partial);
+        sum = __shfl_sync(0xffffffff, sum, 0);
+        float score = sum * scale;
+
+        float w = 0.0f;
+        float corr = 1.0f;
+        int new_max = 0;
+        if (lane == 0) {
+            if (score > max_score) {
+                corr = __expf(max_score - score);
+                sum_exp = sum_exp * corr + 1.0f;
+                max_score = score;
+                w = 1.0f;
+                new_max = 1;
+            } else {
+                w = __expf(score - max_score);
+                sum_exp += w;
+                corr = 1.0f;
+                new_max = 0;
+            }
+        }
+        w = __shfl_sync(0xffffffff, w, 0);
+        corr = __shfl_sync(0xffffffff, corr, 0);
+        new_max = __shfl_sync(0xffffffff, new_max, 0);
+
+        const float *v_head = v_cache + ((size_t)j * 8 + (size_t)kv_h) * 128;
+        const float4 v4 = ((const float4 *)v_head)[lane];
+
+        if (new_max) {
+            out0 = out0 * corr + v4.x;
+            out1 = out1 * corr + v4.y;
+            out2 = out2 * corr + v4.z;
+            out3 = out3 * corr + v4.w;
+        } else {
+            out0 += w * v4.x;
+            out1 += w * v4.y;
+            out2 += w * v4.z;
+            out3 += w * v4.w;
+        }
+    }
+
+    float inv_sum = 0.0f;
+    if (lane == 0) inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    inv_sum = __shfl_sync(0xffffffff, inv_sum, 0);
+
+    ((float4 *)(out_q + h * 128))[lane] = make_float4(out0 * inv_sum,
+                                                      out1 * inv_sum,
+                                                      out2 * inv_sum,
+                                                      out3 * inv_sum);
+}
+
 /* Decoder graph helpers: dynamic KV append + dynamic total_seq (pos on device).
  *
  * These kernels exist primarily to enable CUDA Graph capture for the decoder
@@ -472,6 +659,201 @@ extern "C" __global__ void vox_attn_q4_kv8_f32_dyn(float *out_q,      /* [32*128
     out_q[h * 128 + (lane + 1 * 32)] = out1 * inv_sum;
     out_q[h * 128 + (lane + 2 * 32)] = out2 * inv_sum;
     out_q[h * 128 + (lane + 3 * 32)] = out3 * inv_sum;
+}
+
+/* v2 dynamic attention kernels: same math/layout as v2, but total_seq is
+ * derived from `*p_pos` (device scalar). Used to enable decoder CUDA Graphs. */
+
+extern "C" __global__ void vox_attn_q4_kv8_fp16_dyn_v2(float *out_q,          /* [32*128] */
+                                                       const float *q,        /* [32*128] */
+                                                       const __half *k_cache,  /* [max_seq*8*128] */
+                                                       const __half *v_cache,  /* [max_seq*8*128] */
+                                                       const int *p_pos,
+                                                       int window_size,
+                                                       float scale) {
+    int h = (int)blockIdx.x;     /* 0..31 */
+    int lane = (int)threadIdx.x; /* 0..31 */
+    if (h >= 32 || lane >= 32) return;
+
+    int pos = 0;
+    if (lane == 0) pos = *p_pos;
+    pos = __shfl_sync(0xffffffff, pos, 0);
+    int end = pos + 1;
+
+    int kv_h = h >> 2; /* 4 query heads share 1 KV head */
+
+    const float4 qv = ((const float4 *)(q + h * 128))[lane];
+
+    int start = 0;
+    if (window_size > 0) {
+        int s = end - window_size;
+        if (s > 0) start = s;
+    }
+    if (start < 0) start = 0;
+    if (end < start) end = start;
+
+    float max_score = -1.0e30f;
+    float sum_exp = 0.0f;
+
+    float out0 = 0.0f;
+    float out1 = 0.0f;
+    float out2 = 0.0f;
+    float out3 = 0.0f;
+
+    const __half2 *k2 = (const __half2 *)k_cache;
+    const __half2 *v2 = (const __half2 *)v_cache;
+    size_t row_stride = (size_t)(8 * 128) / 2;              /* 1024 half -> 512 half2 */
+    size_t head_off = (size_t)kv_h * (size_t)128 / 2;       /* 128 half -> 64 half2 */
+    int off2 = lane * 2;                                    /* 0..62 */
+
+    for (int j = start; j < end; j++) {
+        const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
+        float2 k01 = __half22float2(k_row[off2 + 0]);
+        float2 k23 = __half22float2(k_row[off2 + 1]);
+
+        float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
+        float sum = warp_reduce_sum(partial);
+        sum = __shfl_sync(0xffffffff, sum, 0);
+        float score = sum * scale;
+
+        float w = 0.0f;
+        float corr = 1.0f;
+        int new_max = 0;
+        if (lane == 0) {
+            if (score > max_score) {
+                corr = __expf(max_score - score);
+                sum_exp = sum_exp * corr + 1.0f;
+                max_score = score;
+                w = 1.0f;
+                new_max = 1;
+            } else {
+                w = __expf(score - max_score);
+                sum_exp += w;
+                corr = 1.0f;
+                new_max = 0;
+            }
+        }
+        w = __shfl_sync(0xffffffff, w, 0);
+        corr = __shfl_sync(0xffffffff, corr, 0);
+        new_max = __shfl_sync(0xffffffff, new_max, 0);
+
+        const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
+        float2 v01 = __half22float2(v_row[off2 + 0]);
+        float2 v23 = __half22float2(v_row[off2 + 1]);
+
+        if (new_max) {
+            out0 = out0 * corr + v01.x;
+            out1 = out1 * corr + v01.y;
+            out2 = out2 * corr + v23.x;
+            out3 = out3 * corr + v23.y;
+        } else {
+            out0 += w * v01.x;
+            out1 += w * v01.y;
+            out2 += w * v23.x;
+            out3 += w * v23.y;
+        }
+    }
+
+    float inv_sum = 0.0f;
+    if (lane == 0) inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    inv_sum = __shfl_sync(0xffffffff, inv_sum, 0);
+
+    ((float4 *)(out_q + h * 128))[lane] = make_float4(out0 * inv_sum,
+                                                      out1 * inv_sum,
+                                                      out2 * inv_sum,
+                                                      out3 * inv_sum);
+}
+
+extern "C" __global__ void vox_attn_q4_kv8_f32_dyn_v2(float *out_q,      /* [32*128] */
+                                                      const float *q,    /* [32*128] */
+                                                      const float *k_cache, /* [max_seq*8*128] */
+                                                      const float *v_cache, /* [max_seq*8*128] */
+                                                      const int *p_pos,
+                                                      int window_size,
+                                                      float scale) {
+    int h = (int)blockIdx.x;     /* 0..31 */
+    int lane = (int)threadIdx.x; /* 0..31 */
+    if (h >= 32 || lane >= 32) return;
+
+    int pos = 0;
+    if (lane == 0) pos = *p_pos;
+    pos = __shfl_sync(0xffffffff, pos, 0);
+    int end = pos + 1;
+
+    int kv_h = h >> 2;
+
+    const float4 qv = ((const float4 *)(q + h * 128))[lane];
+
+    int start = 0;
+    if (window_size > 0) {
+        int s = end - window_size;
+        if (s > 0) start = s;
+    }
+    if (start < 0) start = 0;
+    if (end < start) end = start;
+
+    float max_score = -1.0e30f;
+    float sum_exp = 0.0f;
+
+    float out0 = 0.0f;
+    float out1 = 0.0f;
+    float out2 = 0.0f;
+    float out3 = 0.0f;
+
+    for (int j = start; j < end; j++) {
+        const float *k_head = k_cache + ((size_t)j * 8 + (size_t)kv_h) * 128;
+        const float4 k4 = ((const float4 *)k_head)[lane];
+
+        float partial = qv.x * k4.x + qv.y * k4.y + qv.z * k4.z + qv.w * k4.w;
+        float sum = warp_reduce_sum(partial);
+        sum = __shfl_sync(0xffffffff, sum, 0);
+        float score = sum * scale;
+
+        float w = 0.0f;
+        float corr = 1.0f;
+        int new_max = 0;
+        if (lane == 0) {
+            if (score > max_score) {
+                corr = __expf(max_score - score);
+                sum_exp = sum_exp * corr + 1.0f;
+                max_score = score;
+                w = 1.0f;
+                new_max = 1;
+            } else {
+                w = __expf(score - max_score);
+                sum_exp += w;
+                corr = 1.0f;
+                new_max = 0;
+            }
+        }
+        w = __shfl_sync(0xffffffff, w, 0);
+        corr = __shfl_sync(0xffffffff, corr, 0);
+        new_max = __shfl_sync(0xffffffff, new_max, 0);
+
+        const float *v_head = v_cache + ((size_t)j * 8 + (size_t)kv_h) * 128;
+        const float4 v4 = ((const float4 *)v_head)[lane];
+
+        if (new_max) {
+            out0 = out0 * corr + v4.x;
+            out1 = out1 * corr + v4.y;
+            out2 = out2 * corr + v4.z;
+            out3 = out3 * corr + v4.w;
+        } else {
+            out0 += w * v4.x;
+            out1 += w * v4.y;
+            out2 += w * v4.z;
+            out3 += w * v4.w;
+        }
+    }
+
+    float inv_sum = 0.0f;
+    if (lane == 0) inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    inv_sum = __shfl_sync(0xffffffff, inv_sum, 0);
+
+    ((float4 *)(out_q + h * 128))[lane] = make_float4(out0 * inv_sum,
+                                                      out1 * inv_sum,
+                                                      out2 * inv_sum,
+                                                      out3 * inv_sum);
 }
 
 extern "C" __global__ void vox_causal_attn_f32(float *out,

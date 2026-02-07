@@ -29,6 +29,10 @@ static CUfunction g_fn_attn_fp16 = 0;
 static CUfunction g_fn_attn_f32 = 0;
 static CUfunction g_fn_attn_dyn_fp16 = 0;
 static CUfunction g_fn_attn_dyn_f32 = 0;
+static CUfunction g_fn_attn_fp16_v2 = 0;
+static CUfunction g_fn_attn_f32_v2 = 0;
+static CUfunction g_fn_attn_dyn_fp16_v2 = 0;
+static CUfunction g_fn_attn_dyn_f32_v2 = 0;
 static CUfunction g_fn_kv_append_dyn_fp16 = 0;
 static CUfunction g_fn_kv_append_dyn_f32 = 0;
 static CUfunction g_fn_causal_attn = 0;
@@ -95,6 +99,19 @@ static int kv_cache_use_fp16(void) {
     const char *env = getenv("VOX_CUDA_KV_FP16");
     if (!env || !env[0]) { cached = 1; return cached; }
     cached = (env[0] != '0');
+    return cached;
+}
+
+static int attn_v2_enabled(void) {
+    /* Opt-in: the v2 attention kernels use a different per-thread layout with
+     * vectorized loads/stores. Keep it behind an env gate until it has broader
+     * coverage across cards/drivers. */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *disable = getenv("VOX_DISABLE_CUDA_ATTN_V2");
+    if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    const char *env = getenv("VOX_CUDA_ATTN_V2");
+    cached = (env && env[0] && env[0] != '0');
     return cached;
 }
 
@@ -510,6 +527,17 @@ static int cuda_load_kernel_module(void) {
             if (!g_fn_attn_dyn_f32)
                 (void)cuModuleGetFunction(&g_fn_attn_dyn_f32, g_mod, "vox_attn_q4_kv8_f32_dyn");
         }
+        /* Optional v2 attention kernels (best-effort). */
+        if (g_mod) {
+            if (!g_fn_attn_f32_v2)
+                (void)cuModuleGetFunction(&g_fn_attn_f32_v2, g_mod, "vox_attn_q4_kv8_f32_v2");
+            if (!g_fn_attn_fp16_v2)
+                (void)cuModuleGetFunction(&g_fn_attn_fp16_v2, g_mod, "vox_attn_q4_kv8_fp16_v2");
+            if (!g_fn_attn_dyn_fp16_v2)
+                (void)cuModuleGetFunction(&g_fn_attn_dyn_fp16_v2, g_mod, "vox_attn_q4_kv8_fp16_dyn_v2");
+            if (!g_fn_attn_dyn_f32_v2)
+                (void)cuModuleGetFunction(&g_fn_attn_dyn_f32_v2, g_mod, "vox_attn_q4_kv8_f32_dyn_v2");
+        }
         return 1;
     }
     if (!vox_cuda_available()) return 0;
@@ -574,6 +602,12 @@ static int cuda_load_kernel_module(void) {
     (void)cuModuleGetFunction(&g_fn_kv_append_dyn_f32, g_mod, "vox_kv_append_f32_dyn");
     (void)cuModuleGetFunction(&g_fn_attn_dyn_fp16, g_mod, "vox_attn_q4_kv8_fp16_dyn");
     (void)cuModuleGetFunction(&g_fn_attn_dyn_f32, g_mod, "vox_attn_q4_kv8_f32_dyn");
+
+    /* Optional v2 attention kernels (best-effort). */
+    (void)cuModuleGetFunction(&g_fn_attn_f32_v2, g_mod, "vox_attn_q4_kv8_f32_v2");
+    (void)cuModuleGetFunction(&g_fn_attn_fp16_v2, g_mod, "vox_attn_q4_kv8_fp16_v2");
+    (void)cuModuleGetFunction(&g_fn_attn_dyn_fp16_v2, g_mod, "vox_attn_q4_kv8_fp16_dyn_v2");
+    (void)cuModuleGetFunction(&g_fn_attn_dyn_f32_v2, g_mod, "vox_attn_q4_kv8_f32_dyn_v2");
     return 1;
 }
 
@@ -1277,7 +1311,12 @@ static int vox_cuda_decoder_attention_step_dev(CUdeviceptr dAttnOut,
     float scale = 1.0f / 11.313708498984761f; /* 1/sqrt(128) */
     void *params[] = { &dAttnOut, &dQ, &k_base, &v_base, &total_seq, &window_size, &scale };
     CUresult r;
-    g_fn_attn = kv_cache_use_fp16() ? g_fn_attn_fp16 : g_fn_attn_f32;
+    int use_v2 = attn_v2_enabled();
+    if (kv_cache_use_fp16()) {
+        g_fn_attn = (use_v2 && g_fn_attn_fp16_v2) ? g_fn_attn_fp16_v2 : g_fn_attn_fp16;
+    } else {
+        g_fn_attn = (use_v2 && g_fn_attn_f32_v2) ? g_fn_attn_f32_v2 : g_fn_attn_f32;
+    }
     r = cuLaunchKernel(g_fn_attn,
                        VOX_DEC_HEADS, 1, 1,
                        32, 1, 1,
@@ -1476,6 +1515,10 @@ void vox_cuda_shutdown(void) {
     g_fn_attn_f32 = 0;
     g_fn_attn_dyn_fp16 = 0;
     g_fn_attn_dyn_f32 = 0;
+    g_fn_attn_fp16_v2 = 0;
+    g_fn_attn_f32_v2 = 0;
+    g_fn_attn_dyn_fp16_v2 = 0;
+    g_fn_attn_dyn_f32_v2 = 0;
     g_fn_kv_append_dyn_fp16 = 0;
     g_fn_kv_append_dyn_f32 = 0;
     g_fn_causal_attn = 0;
@@ -1710,8 +1753,15 @@ int vox_cuda_attention_step(float *attn_out,
     if (!ensure_kv_cache(max_seq, kv_dim)) return 0;
     static int logged = 0;
     if (!logged && vox_verbose >= 1) {
-        fprintf(stderr, "[cuda] decoder attention enabled (cubin, arch=%s, kv_cache=%s)\n",
-                VOX_CUDA_ARCH_STR, kv_cache_use_fp16() ? "fp16" : "fp32");
+        int want_v2 = attn_v2_enabled();
+        int have_v2 = 0;
+        if (want_v2) {
+            have_v2 = kv_cache_use_fp16() ? (g_fn_attn_fp16_v2 != 0) : (g_fn_attn_f32_v2 != 0);
+        }
+        fprintf(stderr, "[cuda] decoder attention enabled (cubin, arch=%s, kv_cache=%s, attn=%s)\n",
+                VOX_CUDA_ARCH_STR,
+                kv_cache_use_fp16() ? "fp16" : "fp32",
+                (want_v2 && have_v2) ? "v2" : "v1");
         logged = 1;
     }
     if (!ensure_attn_workbufs((size_t)VOX_DEC_HEADS * VOX_DEC_HEAD_DIM * sizeof(float),
@@ -1758,7 +1808,12 @@ int vox_cuda_attention_step(float *attn_out,
     /* The kernel expects k_cache/v_cache pointers to the base of this layer's cache. */
     void *params[] = { &g_dAttn, &g_dQ, &k_base, &v_base, &total_seq, &window_size, &scale };
 
-    g_fn_attn = kv_cache_use_fp16() ? g_fn_attn_fp16 : g_fn_attn_f32;
+    int use_v2 = attn_v2_enabled();
+    if (kv_cache_use_fp16()) {
+        g_fn_attn = (use_v2 && g_fn_attn_fp16_v2) ? g_fn_attn_fp16_v2 : g_fn_attn_fp16;
+    } else {
+        g_fn_attn = (use_v2 && g_fn_attn_f32_v2) ? g_fn_attn_f32_v2 : g_fn_attn_f32;
+    }
     r = cuLaunchKernel(g_fn_attn,
                                 VOX_DEC_HEADS, 1, 1,
                                 32, 1, 1,
@@ -2640,6 +2695,7 @@ static int decoder_graph_capture(vox_ctx_t *ctx) {
     int window_size = VOX_DEC_WINDOW;
     int threads = 256;
     int blocks_kv = (kv_dim + threads - 1) / threads;
+    int use_v2 = attn_v2_enabled();
 
     size_t eb = g_kv_elem_bytes ? g_kv_elem_bytes : sizeof(float);
     size_t layer_stride = (size_t)g_kv_max_seq * (size_t)kv_dim * eb;
@@ -2680,7 +2736,12 @@ static int decoder_graph_capture(vox_ctx_t *ctx) {
         if (rr != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(kv_append_dyn)", rr); goto capture_fail; }
 
         void *attn_params[] = { &g_dec_attn, &g_dec_q, &k_base, &v_base, &g_dec_pos_dev, &window_size, &attn_scale };
-        CUfunction fn_attn = want_fp16 ? g_fn_attn_dyn_fp16 : g_fn_attn_dyn_f32;
+        CUfunction fn_attn = 0;
+        if (want_fp16) {
+            fn_attn = (use_v2 && g_fn_attn_dyn_fp16_v2) ? g_fn_attn_dyn_fp16_v2 : g_fn_attn_dyn_fp16;
+        } else {
+            fn_attn = (use_v2 && g_fn_attn_dyn_f32_v2) ? g_fn_attn_dyn_f32_v2 : g_fn_attn_dyn_f32;
+        }
         rr = cuLaunchKernel(fn_attn,
                             VOX_DEC_HEADS, 1, 1,
                             32, 1, 1,
@@ -2726,8 +2787,10 @@ static int decoder_graph_capture(vox_ctx_t *ctx) {
     g_dec_graph_ready = 1;
     g_dec_graph_kv_fp16 = want_fp16;
     if (vox_verbose >= 1) {
-        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s)\n",
-                want_fp16 ? "fp16" : "fp32");
+        int have_v2 = want_fp16 ? (g_fn_attn_dyn_fp16_v2 != 0) : (g_fn_attn_dyn_f32_v2 != 0);
+        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s)\n",
+                want_fp16 ? "fp16" : "fp32",
+                (use_v2 && have_v2) ? "v2" : "v1");
     }
     return 1;
 

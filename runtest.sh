@@ -33,7 +33,7 @@ PHRASES=(
     "consigliarvelo"
     "pubblicizzare i suoi prodotti"
     "alcuno sponsor"
-    "grande distribuzione"
+    "distribuzion"
     "mercati ortofrutticoli"
     "dove si trova"
 )

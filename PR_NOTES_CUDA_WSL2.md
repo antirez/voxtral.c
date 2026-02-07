@@ -26,6 +26,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
 - Decoder full path:
   - Device-side KV cache (FP16 by default) and device-only intermediates.
   - Faster per-token attention kernel (online softmax, warp-synchronous).
+  - Optional attention v2 kernel variant (vectorized loads/stores; opt-in).
   - Optional CUDA Graph capture for the single-token decoder step (reduces CPU launch overhead; opt-in).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
   - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
@@ -104,6 +105,19 @@ On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; ~60s), CUDA G
 - Without graphs: `Wall transcribe 17640 ms`, decoder `19.4 ms/step`
 - With graphs: `Wall transcribe 16785 ms`, decoder `18.2 ms/step`
 
+### Attention v2 (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_ATTN_V2=1
+```
+
+On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), the v2 attention kernel provides a small win:
+
+- Without graphs: decoder `19.2 -> 19.0 ms/step`, `Wall transcribe 17531 -> 17439 ms`
+- With graphs: decoder `18.2 -> 18.1 ms/step`, `Wall transcribe 16772 -> 16719 ms`
+
 ### `samples/I_have_a_dream.ogg` (180s)
 
 Convert once:
@@ -155,3 +169,7 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_DISABLE_CUDA_PREFILL=1`
 - Disable RMSNorm->BF16 fused kernel (debug fallback):
   - `VOX_DISABLE_CUDA_RMSNORM_BF16_FUSED=1`
+- Enable attention v2 kernel variant (opt-in):
+  - `VOX_CUDA_ATTN_V2=1`
+- Disable attention v2 kernel variant (force v1):
+  - `VOX_DISABLE_CUDA_ATTN_V2=1`
