@@ -1,4 +1,8 @@
 voxtral_shaders_source.h
+voxtral_cuda_kernels.cubin
+voxtral_cuda_kernels_cubin.h
+voxtral_cuda_kernels.ptx
+voxtral_cuda_kernels_ptx.h
 voxtral
 voxtral-model/
 pyenv*/
