@@ -10,7 +10,7 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 # Source files
-SRCS = voxtral.c voxtral_kernels.c voxtral_audio.c voxtral_encoder.c voxtral_decoder.c voxtral_tokenizer.c voxtral_safetensors.c
+SRCS = voxtral.c voxtral_kernels.c voxtral_audio.c voxtral_mic.c voxtral_encoder.c voxtral_decoder.c voxtral_tokenizer.c voxtral_safetensors.c
 OBJS = $(SRCS:.c=.o)
 MAIN = main.c
 TARGET = voxtral
@@ -47,7 +47,7 @@ endif
 # =============================================================================
 ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
-blas: LDFLAGS += -framework Accelerate
+blas: LDFLAGS += -framework Accelerate -framework AudioToolbox -framework CoreFoundation
 else
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
 blas: LDFLAGS += -lopenblas
@@ -63,7 +63,7 @@ ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
 MPS_OBJCFLAGS = $(MPS_CFLAGS) -fobjc-arc
-MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation
+MPS_LDFLAGS = $(LDFLAGS) -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph -framework Foundation -framework AudioToolbox -framework CoreFoundation
 
 mps: clean mps-build
 	@echo ""
@@ -147,9 +147,10 @@ endif
 voxtral.o: voxtral.c voxtral.h voxtral_kernels.h voxtral_safetensors.h voxtral_audio.h voxtral_tokenizer.h
 voxtral_kernels.o: voxtral_kernels.c voxtral_kernels.h
 voxtral_audio.o: voxtral_audio.c voxtral_audio.h
+voxtral_mic.o: voxtral_mic.c voxtral_mic.h
 voxtral_encoder.o: voxtral_encoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
 voxtral_decoder.o: voxtral_decoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
 voxtral_tokenizer.o: voxtral_tokenizer.c voxtral_tokenizer.h
 voxtral_safetensors.o: voxtral_safetensors.c voxtral_safetensors.h
-main.o: main.c voxtral.h voxtral_kernels.h
+main.o: main.c voxtral.h voxtral_kernels.h voxtral_audio.h voxtral_mic.h
 inspect_weights.o: inspect_weights.c voxtral_safetensors.h

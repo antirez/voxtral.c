@@ -7,24 +7,28 @@
 #include "voxtral.h"
 #include "voxtral_kernels.h"
 #include "voxtral_audio.h"
+#include "voxtral_mic.h"
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 #define DEFAULT_FEED_CHUNK 16000 /* 1 second at 16kHz */
 
 static void usage(const char *prog) {
     fprintf(stderr, "voxtral.c — Voxtral Realtime 4B speech-to-text\n\n");
-    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin) [options]\n\n", prog);
+    fprintf(stderr, "Usage: %s -d <model_dir> (-i <input.wav> | --stdin | --mic) [options]\n\n", prog);
     fprintf(stderr, "Required:\n");
     fprintf(stderr, "  -d <dir>    Model directory (with consolidated.safetensors, tekken.json)\n");
     fprintf(stderr, "  -i <file>   Input WAV file (16-bit PCM, any sample rate)\n");
     fprintf(stderr, "  --stdin     Read audio from stdin (auto-detect WAV or raw s16le 16kHz mono)\n");
+    fprintf(stderr, "  --mic       Capture audio from default microphone (macOS)\n");
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>   Encoder processing interval in seconds (default: 2.0)\n");
+    fprintf(stderr, "  --mic-secs <s>  Stop mic capture after <s> seconds (default: until Ctrl+C)\n");
     fprintf(stderr, "  --alt <c>   Show alternative tokens within cutoff distance (0.0-1.0)\n");
     fprintf(stderr, "  --debug     Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent    No status output (only transcription on stdout)\n");
@@ -107,12 +111,33 @@ static void feed_and_drain(vox_stream_t *s, const float *samples, int n_samples)
     }
 }
 
+static volatile sig_atomic_t g_stop_mic = 0;
+
+typedef struct {
+    vox_stream_t *stream;
+} mic_cb_ctx_t;
+
+static void handle_sigint(int signo) {
+    (void)signo;
+    g_stop_mic = 1;
+}
+
+static int mic_chunk_cb(const float *samples, int n_samples, void *user) {
+    mic_cb_ctx_t *cb = (mic_cb_ctx_t *)user;
+    if (!cb || !cb->stream) return 1;
+    if (g_stop_mic) return 1;
+    feed_and_drain(cb->stream, samples, n_samples);
+    return g_stop_mic ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *input_wav = NULL;
     int verbosity = 1; /* 0=silent, 1=normal, 2=debug */
     int use_stdin = 0;
+    int use_mic = 0;
     float interval = -1.0f; /* <0 means use default */
+    float mic_seconds = -1.0f; /* <=0 means unlimited */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
@@ -133,6 +158,14 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
+        } else if (strcmp(argv[i], "--mic") == 0) {
+            use_mic = 1;
+        } else if (strcmp(argv[i], "--mic-secs") == 0 && i + 1 < argc) {
+            mic_seconds = (float)atof(argv[++i]);
+            if (mic_seconds <= 0) {
+                fprintf(stderr, "Error: --mic-secs requires a positive number of seconds\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -147,12 +180,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!model_dir || (!input_wav && !use_stdin)) {
+    if (!model_dir || (!input_wav && !use_stdin && !use_mic)) {
         usage(argv[0]);
         return 1;
     }
-    if (input_wav && use_stdin) {
-        fprintf(stderr, "Error: -i and --stdin are mutually exclusive\n");
+    if ((input_wav ? 1 : 0) + use_stdin + use_mic > 1) {
+        fprintf(stderr, "Error: -i, --stdin, and --mic are mutually exclusive\n");
+        return 1;
+    }
+    if (mic_seconds > 0 && !use_mic) {
+        fprintf(stderr, "Error: --mic-secs requires --mic\n");
         return 1;
     }
 
@@ -185,7 +222,37 @@ int main(int argc, char **argv) {
         if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
     }
 
-    if (use_stdin) {
+    if (use_mic) {
+#ifndef __APPLE__
+        fprintf(stderr, "Error: --mic is only supported on macOS\n");
+        vox_stream_free(s);
+        vox_free(ctx);
+        return 1;
+#else
+        mic_cb_ctx_t cb = { .stream = s };
+        int mic_total_samples = 0;
+        g_stop_mic = 0;
+        signal(SIGINT, handle_sigint);
+        if (vox_verbose >= 1) {
+            if (mic_seconds > 0)
+                fprintf(stderr, "Capturing microphone for %.2f seconds...\n", mic_seconds);
+            else
+                fprintf(stderr, "Capturing microphone... press Ctrl+C to stop.\n");
+        }
+
+        if (vox_capture_mic_macos(mic_seconds, feed_chunk, mic_chunk_cb, &cb,
+                                  &g_stop_mic, &mic_total_samples) != 0) {
+            fprintf(stderr, "Microphone capture failed\n");
+            vox_stream_free(s);
+            vox_free(ctx);
+            return 1;
+        }
+        if (mic_total_samples == 0 && vox_verbose >= 1) {
+            fprintf(stderr, "No microphone audio was captured.\n");
+            fprintf(stderr, "Check macOS microphone permission and System Settings input device.\n");
+        }
+#endif
+    } else if (use_stdin) {
         /* Peek at first 4 bytes to detect WAV vs raw */
         uint8_t hdr[4];
         size_t hdr_read = fread(hdr, 1, 4, stdin);

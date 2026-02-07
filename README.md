@@ -32,9 +32,19 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 # Real-time streaming with low latency
 ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
     ./voxtral -d voxtral-model --stdin -I 0.5
+
+# Live microphone transcription on macOS
+./voxtral -d voxtral-model --mic
 ```
 
 That's it. No Python runtime, no CUDA toolkit, no `mistral_common` or vLLM required at inference time.
+
+## Code Organization
+
+- `main.c`: CLI argument parsing and streaming transcription loop.
+- `voxtral_audio.c/.h`: WAV parsing/resampling and mel spectrogram (offline + incremental).
+- `voxtral_mic.c/.h`: microphone capture on macOS (`--mic`), device reporting, stop handling.
+- `voxtral.c/.h`: model loading, encoder/decoder pipeline, and streaming API (`vox_stream_t`).
 
 ### Python Reference Implementation
 
@@ -72,6 +82,7 @@ Tokens stream to stdout as they are generated. By default, timing info is printe
 ./voxtral -d voxtral-model -i samples/test_speech.wav --silent    # no stderr output
 ./voxtral -d voxtral-model -i samples/test_speech.wav --debug     # per-layer/per-chunk details
 ./voxtral -d voxtral-model -i samples/test_speech.wav --alt 0.5   # show alternative tokens
+./voxtral -d voxtral-model --mic --mic-secs 10                    # mic capture for 10 seconds (macOS)
 ```
 
 ### Alternative Tokens
@@ -114,6 +125,24 @@ cat recording.wav | ./voxtral -d voxtral-model --stdin
 ```
 
 `--stdin` and `-i` are mutually exclusive.
+
+### Live Microphone Input (macOS)
+
+Use `--mic` to capture from the default system microphone and transcribe live:
+
+```bash
+./voxtral -d voxtral-model --mic
+```
+
+By default this runs until you press `Ctrl+C`. You can stop automatically after a fixed duration:
+
+```bash
+./voxtral -d voxtral-model --mic --mic-secs 15
+```
+
+`--mic` is mutually exclusive with `-i` and `--stdin`.
+At start, the CLI prints the selected input device. If no audio is captured, it prints a permission/routing hint.
+On non-macOS platforms, `--mic` returns an explicit error; file/stdin transcription works unchanged.
 
 To convert files to WAV format, just use `ffmpeg`:
 
