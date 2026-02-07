@@ -82,6 +82,18 @@ int vox_cuda_decoder_forward_full(int *out_token,
                                   vox_ctx_t *ctx,
                                   const float *input_embeds);
 
+/* CUDA prefill fast path (seq_len > 1).
+ * Computes the full transformer prefill on GPU and keeps both the device KV
+ * cache and the host KV cache in sync. Returns 1 on success, 0 on fallback.
+ *
+ * rope_freqs is the precomputed RoPE frequency table for the prefill tokens:
+ *   shape = [seq_len, (head_dim/2)*2].
+ */
+int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
+                                  const float *input_embeds,
+                                  int seq_len,
+                                  const float *rope_freqs);
+
 const char *vox_cuda_device_name(void);
 void vox_cuda_shutdown(void);
 
