@@ -367,8 +367,10 @@ struct vox_stream {
 
     /* Adapter output buffer (growing) */
     float *adapter_buf;
-    int total_adapter;
-    int adapter_cap;
+    int total_adapter;       /* Total tokens generated (logical) */
+    int adapter_len;         /* Physical tokens in buffer */
+    int adapter_cap;         /* Allocated capacity */
+    int adapter_pos_offset;  /* Logical offset from compactions */
 
     /* Decoder state */
     int decoder_started;
@@ -622,6 +624,24 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
     return result;
 }
 
+/* Compact adapter buffer: discard old tokens, keep sliding window */
+static void stream_adapter_compact(vox_stream_t *s) {
+    int dim = VOX_DEC_DIM;
+    int keep = VOX_ADA_WINDOW;
+
+    if (s->adapter_len <= keep) return;
+
+    int discard = s->adapter_len - keep;
+    size_t keep_bytes = (size_t)keep * dim * sizeof(float);
+
+    memmove(s->adapter_buf,
+            s->adapter_buf + (size_t)discard * dim,
+            keep_bytes);
+
+    s->adapter_pos_offset += discard;
+    s->adapter_len = keep;
+}
+
 /* Run encoder incrementally on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
     int total_mel = 0;
@@ -689,18 +709,22 @@ static void stream_run_encoder(vox_stream_t *s) {
         free(combined);
 
         if (adapter_chunk && chunk_tokens > 0) {
+            /* Compact adapter buffer if needed before appending */
+            stream_adapter_compact(s);
+
             /* Append to adapter buffer */
-            if (s->total_adapter + chunk_tokens > s->adapter_cap) {
+            if (s->adapter_len + chunk_tokens > s->adapter_cap) {
                 int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
-                while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
+                while (new_cap < s->adapter_len + chunk_tokens) new_cap *= 2;
                 float *tmp = (float *)realloc(s->adapter_buf,
                     (size_t)new_cap * dim * sizeof(float));
                 if (!tmp) { free(adapter_chunk); free(enc_out); return; }
                 s->adapter_buf = tmp;
                 s->adapter_cap = new_cap;
             }
-            memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
+            memcpy(s->adapter_buf + (size_t)s->adapter_len * dim,
                    adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
+            s->adapter_len += chunk_tokens;
             s->total_adapter += chunk_tokens;
             free(adapter_chunk);
         } else {
@@ -853,7 +877,8 @@ static void stream_run_decoder(vox_stream_t *s) {
         int gen_before = s->n_generated;
         while (s->gen_pos < s->total_adapter) {
             tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
-            const float *a = s->adapter_buf + (size_t)s->gen_pos * dim;
+            int physical_pos = s->gen_pos - s->adapter_pos_offset;
+            const float *a = s->adapter_buf + (size_t)physical_pos * dim;
             for (int j = 0; j < dim; j++)
                 s->step_embed[j] = a[j] + s->tok_tmp[j];
 
@@ -919,6 +944,10 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
 
     /* Default processing interval: 2 seconds (200 mel frames) */
     s->min_new_mel = (int)(STREAM_DEFAULT_INTERVAL * 100.0f);
+
+    /* Initialize adapter buffer fields */
+    s->adapter_len = 0;
+    s->adapter_pos_offset = 0;
 
     return s;
 }

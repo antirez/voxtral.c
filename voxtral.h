@@ -44,6 +44,7 @@
 #define VOX_DEC_HEAD_DIM     128
 #define VOX_DEC_HIDDEN       9216
 #define VOX_DEC_WINDOW       8192
+#define VOX_ADA_WINDOW       2048
 #define VOX_DEC_NORM_EPS     1e-5f
 #define VOX_VOCAB_SIZE       131072
 #define VOX_ADA_NORM_DIM     32
