@@ -700,6 +700,33 @@ static int stream_use_cuda_encoder_full(void) {
 #endif
 }
 
+/* Optional: keep adapter embeddings on device and let CUDA build the decoder step
+ * embeddings directly from the adapter buffer (opt-in via VOX_CUDA_PIPELINE_FULL=1). */
+static int stream_use_cuda_pipeline_full(void) {
+#ifdef USE_CUDA
+    static int cached = -1;
+    if (cached != -1) return cached;
+
+    const char *disable = getenv("VOX_DISABLE_CUDA_PIPELINE_FULL");
+    if (disable && disable[0] && disable[0] != '0') {
+        cached = 0;
+        return cached;
+    }
+
+    const char *env = getenv("VOX_CUDA_PIPELINE_FULL");
+    if (!env || !env[0] || env[0] == '0') {
+        cached = 0;
+        return cached;
+    }
+
+    /* Requires the full CUDA encoder path since we rely on device-side adapter output. */
+    cached = stream_use_cuda_encoder_full();
+    return cached;
+#else
+    return 0;
+#endif
+}
+
 /* Run encoder on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
     int total_mel = 0;
@@ -722,6 +749,11 @@ static void stream_run_encoder(vox_stream_t *s) {
                 slice_start = 0;
                 actual_overlap_mel = 0;
                 s->total_adapter = 0;
+#ifdef USE_CUDA
+                if (stream_use_cuda_pipeline_full()) {
+                    vox_cuda_stream_adapter_reset();
+                }
+#endif
             } else {
                 actual_overlap_mel = s->mel_cursor - slice_start;
             }
@@ -742,11 +774,19 @@ static void stream_run_encoder(vox_stream_t *s) {
 
             int used_cuda = 0;
 #ifdef USE_CUDA
-            used_cuda = vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
-                                                s->ctx,
-                                                mel_data + (size_t)slice_start * VOX_MEL_BINS,
-                                                slice_len,
-                                                actual_overlap_mel);
+            if (stream_use_cuda_pipeline_full()) {
+                used_cuda = vox_cuda_encode_adapter_stream_append(&chunk_tokens,
+                                                                  s->ctx,
+                                                                  mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                                                                  slice_len,
+                                                                  actual_overlap_mel);
+            } else {
+                used_cuda = vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
+                                                    s->ctx,
+                                                    mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                                                    slice_len,
+                                                    actual_overlap_mel);
+            }
 #endif
 
             if (!used_cuda) {
@@ -777,19 +817,24 @@ static void stream_run_encoder(vox_stream_t *s) {
             s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
                              (t1.tv_usec - t0.tv_usec) / 1000.0;
 
-            if (chunk_tokens > 0 && adapter_chunk) {
-                if (s->total_adapter + chunk_tokens > s->adapter_cap) {
-                    int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
-                    while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
-                    float *tmp = (float *)realloc(s->adapter_buf,
-                        (size_t)new_cap * dim * sizeof(float));
-                    if (!tmp) { free(adapter_chunk); return; }
-                    s->adapter_buf = tmp;
-                    s->adapter_cap = new_cap;
+            if (chunk_tokens > 0) {
+                if (stream_use_cuda_pipeline_full() && !adapter_chunk) {
+                    /* Device-side adapter buffer was appended by CUDA. */
+                    s->total_adapter += chunk_tokens;
+                } else if (adapter_chunk) {
+                    if (s->total_adapter + chunk_tokens > s->adapter_cap) {
+                        int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
+                        while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
+                        float *tmp = (float *)realloc(s->adapter_buf,
+                            (size_t)new_cap * dim * sizeof(float));
+                        if (!tmp) { free(adapter_chunk); return; }
+                        s->adapter_buf = tmp;
+                        s->adapter_cap = new_cap;
+                    }
+                    memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
+                           adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
+                    s->total_adapter += chunk_tokens;
                 }
-                memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
-                       adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
-                s->total_adapter += chunk_tokens;
             }
             free(adapter_chunk);
 
@@ -980,12 +1025,30 @@ static void stream_run_decoder(vox_stream_t *s) {
         float *prompt_embeds = (float *)malloc((size_t)prompt_len * dim * sizeof(float));
         if (!prompt_embeds) return;
 
-        for (int i = 0; i < prompt_len; i++) {
-            int tok = (i == 0) ? TOKEN_BOS : TOKEN_STREAMING_PAD;
-            tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, tok, dim);
-            const float *a = s->adapter_buf + (size_t)i * dim;
-            float *dst = prompt_embeds + (size_t)i * dim;
-            for (int j = 0; j < dim; j++) dst[j] = a[j] + s->tok_tmp[j];
+        if (stream_use_cuda_pipeline_full()) {
+#ifdef USE_CUDA
+            if (!vox_cuda_stream_adapter_copy_prompt(prompt_embeds, prompt_len)) {
+                free(prompt_embeds);
+                return;
+            }
+#else
+            free(prompt_embeds);
+            return;
+#endif
+            for (int i = 0; i < prompt_len; i++) {
+                int tok = (i == 0) ? TOKEN_BOS : TOKEN_STREAMING_PAD;
+                tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, tok, dim);
+                float *dst = prompt_embeds + (size_t)i * dim;
+                for (int j = 0; j < dim; j++) dst[j] += s->tok_tmp[j];
+            }
+        } else {
+            for (int i = 0; i < prompt_len; i++) {
+                int tok = (i == 0) ? TOKEN_BOS : TOKEN_STREAMING_PAD;
+                tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, tok, dim);
+                const float *a = s->adapter_buf + (size_t)i * dim;
+                float *dst = prompt_embeds + (size_t)i * dim;
+                for (int j = 0; j < dim; j++) dst[j] = a[j] + s->tok_tmp[j];
+            }
         }
 
         s->ctx->kv_cache_len = 0;
@@ -1042,13 +1105,24 @@ static void stream_run_decoder(vox_stream_t *s) {
         gettimeofday(&t0, NULL);
         int gen_before = s->n_generated;
         while (s->gen_pos < s->total_adapter) {
-            tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
-            const float *a = s->adapter_buf + (size_t)s->gen_pos * dim;
-            for (int j = 0; j < dim; j++)
-                s->step_embed[j] = a[j] + s->tok_tmp[j];
+            if (stream_use_cuda_pipeline_full()) {
+#ifdef USE_CUDA
+                int tok = 2;
+                if (!vox_cuda_decoder_forward_from_stream_adapter(&tok, logits_out, s->ctx, s->prev_token)) return;
+                s->prev_token = tok;
+                s->n_generated++;
+#else
+                return;
+#endif
+            } else {
+                tok_embed_bf16_to_f32(s->tok_tmp, tok_emb_bf16, s->prev_token, dim);
+                const float *a = s->adapter_buf + (size_t)s->gen_pos * dim;
+                for (int j = 0; j < dim; j++)
+                    s->step_embed[j] = a[j] + s->tok_tmp[j];
 
-            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
-            s->n_generated++;
+                s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
+                s->n_generated++;
+            }
 
             if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
                 const char *alts[VOX_MAX_ALT];
@@ -1079,6 +1153,14 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
     if (!s) return NULL;
 
     s->ctx = ctx;
+
+#ifdef USE_CUDA
+    /* Full CUDA pipeline uses a global device-side adapter buffer; ensure it
+     * starts clean for each new stream. */
+    if (stream_use_cuda_pipeline_full()) {
+        vox_cuda_stream_adapter_reset();
+    }
+#endif
 
     /* Load tokenizer */
     char tok_path[1024];
@@ -1238,6 +1320,13 @@ void vox_stream_free(vox_stream_t *s) {
                     s->n_generated > 1 ? gen_ms / (s->n_generated - 1) : 0);
         }
     }
+
+#ifdef USE_CUDA
+    /* Avoid leaking pipeline state into the next run (device-side adapter is global). */
+    if (stream_use_cuda_pipeline_full()) {
+        vox_cuda_stream_adapter_reset();
+    }
+#endif
 
     vox_mel_free(s->mel_ctx);
     if (s->tokenizer) vox_tokenizer_free(s->tokenizer);

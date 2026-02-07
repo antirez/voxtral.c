@@ -36,6 +36,28 @@ make cuda >/dev/null
 echo "[4/4] run CUDA transcript"
 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent | normalize > /tmp/voxtral_ref_cuda.txt
 
+if [[ "${VOX_TEST_CUDA_PIPELINE_FULL:-0}" != "0" ]]; then
+  echo "[opt] run CUDA pipeline transcript (VOX_CUDA_PIPELINE_FULL=1)"
+  VOX_CUDA_PIPELINE_FULL=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent | normalize > /tmp/voxtral_ref_cuda_pipeline.txt
+  python3 - <<PY
+from pathlib import Path
+import difflib
+
+base = Path('/tmp/voxtral_ref_cuda.txt').read_text().strip().split()
+pipe = Path('/tmp/voxtral_ref_cuda_pipeline.txt').read_text().strip().split()
+
+sm = difflib.SequenceMatcher(a=base, b=pipe)
+ratio = 1.0 - sm.ratio()
+print(f"pipeline_token_mismatch_ratio={ratio:.6f}")
+print(f"base_tokens={len(base)} pipeline_tokens={len(pipe)}")
+
+tol = float('${TOLERANCE_RATIO}')
+if ratio > tol:
+    raise SystemExit(f"FAIL: pipeline mismatch ratio {ratio:.6f} exceeds tolerance {tol:.6f}")
+print("PASS (pipeline)")
+PY
+fi
+
 python3 - <<PY
 from pathlib import Path
 import difflib

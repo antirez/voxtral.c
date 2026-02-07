@@ -77,6 +77,33 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
                             int mel_frames,
                             int overlap_mel);
 
+/* Optional: full CUDA streaming pipeline (encoder+adapter outputs kept on
+ * device, decoder consumes adapter embeddings directly). Opt-in via
+ * VOX_CUDA_PIPELINE_FULL=1. */
+void vox_cuda_stream_adapter_reset(void);
+
+/* Copy the first `n_tokens` adapter embeddings from the device-side adapter
+ * buffer into `out_host` (float32, shape [n_tokens, VOX_DEC_DIM]). Used to
+ * build the initial decoder prompt on CPU without copying the full adapter. */
+int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens);
+
+/* Run CUDA full encoder+adapter and append the resulting adapter embeddings
+ * to the internal device-side adapter buffer. Returns 1 on success. */
+int vox_cuda_encode_adapter_stream_append(int *out_tokens,
+                                          vox_ctx_t *ctx,
+                                          const float *mel,
+                                          int mel_frames,
+                                          int overlap_mel);
+
+/* Decoder single-token step that pulls the current adapter embedding from the
+ * device-side adapter buffer (using logical position = kv_pos_offset+kv_cache_len).
+ * prev_token is the previous generated token id used for the input embedding.
+ * Returns 1 on success, 0 on fallback. */
+int vox_cuda_decoder_forward_from_stream_adapter(int *out_token,
+                                                 float *logits_or_null,
+                                                 vox_ctx_t *ctx,
+                                                 int prev_token);
+
 int vox_cuda_decoder_forward_full(int *out_token,
                                   float *logits_or_null,
                                   vox_ctx_t *ctx,
