@@ -32,6 +32,16 @@ printf "[ok] CUDA graphs (no v3) smoke output bytes: %s\n" "$(wc -c </tmp/voxtra
 VOX_CUDA_CONV_STEM=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_conv_stem_smoke.txt
 printf "[ok] CUDA conv-stem smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_conv_stem_smoke.txt)"
 
+# Optional full CUDA pipeline smoke (encoder adapter stays on device, decoder
+# consumes adapter embeddings directly). Enable with: VOX_VALIDATE_PIPELINE_FULL=1
+if [[ "${VOX_VALIDATE_PIPELINE_FULL:-0}" != "0" ]]; then
+  VOX_CUDA_PIPELINE_FULL=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_pipeline_smoke.txt
+  printf "[ok] CUDA pipeline smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_pipeline_smoke.txt)"
+
+  VOX_CUDA_PIPELINE_FULL=1 VOX_CUDA_GRAPHS=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_pipeline_graph_smoke.txt
+  printf "[ok] CUDA pipeline+graphs smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_pipeline_graph_smoke.txt)"
+fi
+
 # stdin smoke
 cat "$SAMPLE_FILE" | ./voxtral -d "$MODEL_DIR" --stdin --silent >/tmp/voxtral_cuda_stdin_smoke.txt
 printf "[ok] CUDA stdin smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_stdin_smoke.txt)"

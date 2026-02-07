@@ -1696,6 +1696,22 @@ extern "C" __global__ void vox_apply_rope_f32(float *x,
     row[i1] = a * si + b * c;
 }
 
+/* Build the decoder step embedding on-device:
+ *   dst[dim] = adapter[logical_pos, dim] + tok_embed_bf16[token_id, dim] */
+extern "C" __global__ void vox_step_embed_from_adapter_f32(float *dst,
+                                                           const float *adapter,
+                                                           const uint16_t *tok_emb_bf16,
+                                                           int token_id,
+                                                           int logical_pos,
+                                                           int dim) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= dim) return;
+    const float *a = adapter + (size_t)logical_pos * (size_t)dim;
+    const uint16_t *t = tok_emb_bf16 + (size_t)token_id * (size_t)dim;
+    float tf = __uint_as_float(((uint32_t)t[idx]) << 16);
+    dst[idx] = a[idx] + tf;
+}
+
 extern "C" __global__ void vox_downsample4_concat_f32(float *dst,
                                                       const float *src,
                                                       int start,

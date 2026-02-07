@@ -17,6 +17,10 @@
 #define VOX_CUDA_ATTN_V3_CHUNK 256
 #define VOX_CUDA_ATTN_V3_CHUNKS ((VOX_DEC_WINDOW + VOX_CUDA_ATTN_V3_CHUNK - 1) / VOX_CUDA_ATTN_V3_CHUNK)
 
+/* Forward declarations for helpers referenced before their definition. */
+static void log_cu_error(const char *what, CUresult r);
+static int pipeline_full_enabled(void);
+
 static cublasHandle_t g_handle;
 static cublasLtHandle_t g_lt_handle;
 static CUcontext g_ctx;
@@ -62,6 +66,7 @@ static CUfunction g_fn_chfirst_to_rowmajor = 0;
 static CUfunction g_fn_f32_to_bf16 = 0;
 static CUfunction g_fn_f32_to_f16 = 0;
 static CUfunction g_fn_apply_rope = 0;
+static CUfunction g_fn_step_embed_from_adapter = 0;
 static CUfunction g_fn_downsample4 = 0;
 static CUfunction g_fn_argmax = 0;
 
@@ -113,13 +118,15 @@ static int kv_cache_use_fp16(void) {
 }
 
 static int conv_stem_cuda_enabled(void) {
-    /* Opt-in: GPU conv stem removes CPU-side im2col overhead for conv0/conv1. */
+    /* Opt-in: GPU conv stem removes CPU-side im2col overhead for conv0/conv1.
+     * In VOX_CUDA_PIPELINE_FULL mode we default to attempting the GPU conv stem
+     * unless explicitly disabled. */
     static int cached = -1;
     if (cached != -1) return cached;
     const char *disable = getenv("VOX_DISABLE_CUDA_CONV_STEM");
     if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
     const char *env = getenv("VOX_CUDA_CONV_STEM");
-    cached = (env && env[0] && env[0] != '0');
+    cached = ((env && env[0] && env[0] != '0') || pipeline_full_enabled());
     return cached;
 }
 
@@ -265,6 +272,12 @@ static CUdeviceptr g_enc_mid = 0;
 static CUdeviceptr g_enc_mid_bf16 = 0;
 static CUdeviceptr g_enc_adapter = 0;
 
+/* Optional: device-side adapter buffer for full streaming pipeline
+ * (VOX_CUDA_PIPELINE_FULL=1). Holds float32 embeddings [n_tokens, VOX_DEC_DIM]. */
+static CUdeviceptr g_stream_adapter = 0;
+static int g_stream_adapter_len = 0;        /* in tokens */
+static int g_stream_adapter_cap_tokens = 0; /* in tokens */
+
 /* Optional CUDA conv stem buffers (encoder front-end). */
 static CUdeviceptr g_enc_mel = 0;
 static CUdeviceptr g_enc_im2col0 = 0;
@@ -352,6 +365,80 @@ static int ensure_buffer(CUdeviceptr *buf, size_t *cap, size_t needed_bytes) {
     *cap = 0;
     if (cuMemAlloc(buf, needed_bytes) != CUDA_SUCCESS) return 0;
     *cap = needed_bytes;
+    return 1;
+}
+
+static int pipeline_full_enabled(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *disable = getenv("VOX_DISABLE_CUDA_PIPELINE_FULL");
+    if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    const char *env = getenv("VOX_CUDA_PIPELINE_FULL");
+    cached = (env && env[0] && env[0] != '0');
+    return cached;
+}
+
+static int pipeline_adapter_cap_tokens(void) {
+    /* Default capacity: enough for ~11 minutes of audio (each adapter token ~80ms). */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    int cap = 8192;
+    const char *env = getenv("VOX_CUDA_ADAPTER_CAP_TOKENS");
+    if (env && env[0]) {
+        long v = strtol(env, NULL, 10);
+        if (v > 0 && v <= 1 * 1024 * 1024) cap = (int)v;
+    }
+    cached = cap;
+    return cached;
+}
+
+static int ensure_stream_adapter(int need_total_tokens) {
+    if (need_total_tokens <= 0) return 0;
+    if (!vox_cuda_available()) return 0;
+
+    int dim = VOX_DEC_DIM;
+    if (g_stream_adapter && g_stream_adapter_cap_tokens >= need_total_tokens) return 1;
+
+    int new_cap = g_stream_adapter_cap_tokens ? g_stream_adapter_cap_tokens : pipeline_adapter_cap_tokens();
+    while (new_cap < need_total_tokens) new_cap *= 2;
+
+    size_t new_bytes = (size_t)new_cap * (size_t)dim * sizeof(float);
+    CUdeviceptr new_dev = 0;
+
+    (void)cuCtxSetCurrent(g_ctx);
+    CUresult r = cuMemAlloc(&new_dev, new_bytes);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuMemAlloc(stream_adapter)", r); return 0; }
+
+    if (g_stream_adapter && g_stream_adapter_len > 0) {
+        size_t copy_bytes = (size_t)g_stream_adapter_len * (size_t)dim * sizeof(float);
+        r = cuMemcpyDtoDAsync(new_dev, g_stream_adapter, copy_bytes, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("cuMemcpyDtoDAsync(stream_adapter_grow)", r); cuMemFree(new_dev); return 0; }
+        r = cuStreamSynchronize(g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("sync(stream_adapter_grow)", r); cuMemFree(new_dev); return 0; }
+    }
+    if (g_stream_adapter) cuMemFree(g_stream_adapter);
+
+    g_stream_adapter = new_dev;
+    g_stream_adapter_cap_tokens = new_cap;
+    return 1;
+}
+
+void vox_cuda_stream_adapter_reset(void) {
+    if (!vox_cuda_available()) return;
+    (void)cuCtxSetCurrent(g_ctx);
+    g_stream_adapter_len = 0;
+}
+
+int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens) {
+    if (!vox_cuda_available()) return 0;
+    if (!out_host || n_tokens <= 0) return 0;
+    if (!g_stream_adapter || g_stream_adapter_len < n_tokens) return 0;
+    (void)cuCtxSetCurrent(g_ctx);
+    size_t bytes = (size_t)n_tokens * (size_t)VOX_DEC_DIM * sizeof(float);
+    CUresult r = cuMemcpyDtoHAsync(out_host, g_stream_adapter, bytes, g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("DtoH(adapter_prompt)", r); return 0; }
+    r = cuStreamSynchronize(g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("sync(adapter_prompt)", r); return 0; }
     return 1;
 }
 
@@ -619,6 +706,11 @@ static int cuda_load_kernel_module(void) {
             if (!g_fn_chfirst_to_rowmajor)
                 (void)cuModuleGetFunction(&g_fn_chfirst_to_rowmajor, g_mod, "vox_chfirst_to_rowmajor_f32");
         }
+        /* Optional streaming pipeline helper kernels (best-effort). */
+        if (g_mod) {
+            if (!g_fn_step_embed_from_adapter)
+                (void)cuModuleGetFunction(&g_fn_step_embed_from_adapter, g_mod, "vox_step_embed_from_adapter_f32");
+        }
         return 1;
     }
     if (!vox_cuda_available()) return 0;
@@ -677,6 +769,7 @@ static int cuda_load_kernel_module(void) {
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_f32_to_f16)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_apply_rope, g_mod, "vox_apply_rope_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_apply_rope_f32)", r); return 0; }
+    (void)cuModuleGetFunction(&g_fn_step_embed_from_adapter, g_mod, "vox_step_embed_from_adapter_f32");
     r = cuModuleGetFunction(&g_fn_downsample4, g_mod, "vox_downsample4_concat_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_downsample4_concat_f32)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_argmax, g_mod, "vox_argmax_f32");
@@ -1107,6 +1200,29 @@ static int launch_apply_rope(CUdeviceptr x,
                                 0, g_stream,
                                 params, NULL);
     if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(apply_rope)", r); return 0; }
+    return 1;
+}
+
+static int launch_step_embed_from_adapter(CUdeviceptr dst,
+                                          CUdeviceptr adapter,
+                                          CUdeviceptr tok_emb_bf16,
+                                          int token_id,
+                                          int logical_pos,
+                                          int dim) {
+    if (!dst || !adapter || !tok_emb_bf16) return 0;
+    if (token_id < 0 || logical_pos < 0 || dim <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_step_embed_from_adapter) return 0;
+
+    int threads = 256;
+    int blocks = (dim + threads - 1) / threads;
+    void *params[] = { &dst, &adapter, &tok_emb_bf16, &token_id, &logical_pos, &dim };
+    CUresult r = cuLaunchKernel(g_fn_step_embed_from_adapter,
+                                blocks, 1, 1,
+                                threads, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(step_embed_from_adapter)", r); return 0; }
     return 1;
 }
 
@@ -1776,6 +1892,11 @@ void vox_cuda_shutdown(void) {
     g_kv_dim = 0;
     g_kv_elem_bytes = 0;
 
+    if (g_stream_adapter) cuMemFree(g_stream_adapter);
+    g_stream_adapter = 0;
+    g_stream_adapter_len = 0;
+    g_stream_adapter_cap_tokens = 0;
+
     if (g_mod) cuModuleUnload(g_mod);
     g_mod = 0;
     g_fn_attn = 0;
@@ -1813,6 +1934,7 @@ void vox_cuda_shutdown(void) {
     g_fn_f32_to_bf16 = 0;
     g_fn_f32_to_f16 = 0;
     g_fn_apply_rope = 0;
+    g_fn_step_embed_from_adapter = 0;
     g_fn_downsample4 = 0;
     g_fn_argmax = 0;
 
@@ -2848,6 +2970,29 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
     if (!launch_f32_to_bf16(g_enc_mid_bf16, g_enc_mid, ds_len * VOX_DEC_DIM)) return 0;
     if (!gemm_t_bf16_bf16_f32(g_enc_adapter, g_enc_mid_bf16, dW1, ds_len, VOX_DEC_DIM, VOX_DEC_DIM)) return 0;
 
+    /* Optional: full CUDA streaming pipeline keeps adapter output on device and
+     * appends it to a device-side buffer (avoids a large DtoH copy). */
+    if (pipeline_full_enabled()) {
+        int need_total = g_stream_adapter_len + ds_len;
+        if (ensure_stream_adapter(need_total)) {
+            CUdeviceptr dst = g_stream_adapter + (size_t)g_stream_adapter_len * (size_t)VOX_DEC_DIM * sizeof(float);
+            r = cuMemcpyDtoDAsync(dst, g_enc_adapter, bytes_mid, g_stream);
+            if (r == CUDA_SUCCESS) {
+                r = cuStreamSynchronize(g_stream);
+                if (r == CUDA_SUCCESS) {
+                    g_stream_adapter_len = need_total;
+                    *out_tokens = ds_len;
+                    *out = NULL;
+                    return 1;
+                }
+                log_cu_error("sync(stream_adapter_append)", r);
+            } else {
+                log_cu_error("cuMemcpyDtoDAsync(stream_adapter_append)", r);
+            }
+        }
+        /* Fall back to the regular host-output path if device buffering fails. */
+    }
+
     float *host_out = (float *)malloc(bytes_mid);
     if (!host_out) return 0;
     r = cuMemcpyDtoHAsync(host_out, g_enc_adapter, bytes_mid, g_stream);
@@ -2857,6 +3002,44 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
 
     *out_tokens = ds_len;
     *out = host_out;
+    return 1;
+}
+
+int vox_cuda_encode_adapter_stream_append(int *out_tokens,
+                                          vox_ctx_t *ctx,
+                                          const float *mel,
+                                          int mel_frames,
+                                          int overlap_mel) {
+    if (!out_tokens) return 0;
+    *out_tokens = 0;
+    if (!pipeline_full_enabled()) return 0;
+    if (!vox_cuda_available()) return 0;
+
+    float *host_out = NULL;
+    int tokens = 0;
+    int ok = vox_cuda_encode_adapter(&host_out, &tokens, ctx, mel, mel_frames, overlap_mel);
+    if (!ok) { free(host_out); return 0; }
+
+    /* In VOX_CUDA_PIPELINE_FULL mode, vox_cuda_encode_adapter should have already
+     * appended to the device-side adapter buffer and returned host_out==NULL.
+     * If it fell back to host output, upload+append here as a slow fallback. */
+    if (tokens > 0 && host_out) {
+        int need_total = g_stream_adapter_len + tokens;
+        if (!ensure_stream_adapter(need_total)) { free(host_out); return 0; }
+        CUdeviceptr dst = g_stream_adapter + (size_t)g_stream_adapter_len * (size_t)VOX_DEC_DIM * sizeof(float);
+        size_t bytes = (size_t)tokens * (size_t)VOX_DEC_DIM * sizeof(float);
+        (void)cuCtxSetCurrent(g_ctx);
+        CUresult r = cuMemcpyHtoDAsync(dst, host_out, bytes, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("HtoD(stream_adapter_from_host)", r); free(host_out); return 0; }
+        r = cuStreamSynchronize(g_stream);
+        free(host_out);
+        if (r != CUDA_SUCCESS) { log_cu_error("sync(stream_adapter_from_host)", r); return 0; }
+        g_stream_adapter_len = need_total;
+    } else {
+        free(host_out);
+    }
+
+    *out_tokens = tokens;
     return 1;
 }
 
@@ -3233,8 +3416,10 @@ capture_fail_destroy:
 static int vox_cuda_decoder_forward_full_graph(int *out_token,
                                                float *logits_or_null,
                                                vox_ctx_t *ctx,
-                                               const float *input_embeds) {
-    if (!out_token || !ctx || !input_embeds) return 0;
+                                               const float *input_embeds_or_null,
+                                               int input_on_device) {
+    if (!out_token || !ctx) return 0;
+    if (!input_on_device && !input_embeds_or_null) return 0;
     if (!decoder_graph_wanted()) return 0;
     if (!vox_cuda_available()) return 0;
     if (!cuda_load_kernel_module()) return 0;
@@ -3260,8 +3445,10 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
 
     /* Upload step embedding + RoPE + pos scalar; then launch the captured graph. */
     CUresult r;
-    r = cuMemcpyHtoDAsync(g_dec_x, input_embeds, (size_t)dim * sizeof(float), g_stream);
-    if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_x_graph)", r); return 0; }
+    if (!input_on_device) {
+        r = cuMemcpyHtoDAsync(g_dec_x, input_embeds_or_null, (size_t)dim * sizeof(float), g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_x_graph)", r); return 0; }
+    }
 
     int logical_pos = ctx->kv_pos_offset + pos;
     int positions[1] = { logical_pos };
@@ -3293,20 +3480,22 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
     return 1;
 }
 
-int vox_cuda_decoder_forward_full(int *out_token,
-                                  float *logits_or_null,
-                                  vox_ctx_t *ctx,
-                                  const float *input_embeds) {
+static int vox_cuda_decoder_forward_full_impl(int *out_token,
+                                              float *logits_or_null,
+                                              vox_ctx_t *ctx,
+                                              const float *input_embeds_or_null,
+                                              int input_on_device) {
     if (!out_token) return 0;
     *out_token = 2;
     if (!vox_cuda_available()) return 0;
     const char *disable = getenv("VOX_DISABLE_CUDA_DECODER_FULL");
     if (disable && disable[0] && disable[0] != '0') return 0;
-    if (!ctx || !input_embeds) return 0;
+    if (!ctx) return 0;
+    if (!input_on_device && !input_embeds_or_null) return 0;
     if (!cuda_load_kernel_module()) return 0;
 
     /* Optional CUDA Graph fast path (opt-in). */
-    if (vox_cuda_decoder_forward_full_graph(out_token, logits_or_null, ctx, input_embeds)) {
+    if (vox_cuda_decoder_forward_full_graph(out_token, logits_or_null, ctx, input_embeds_or_null, input_on_device)) {
         return 1;
     }
 
@@ -3345,8 +3534,10 @@ int vox_cuda_decoder_forward_full(int *out_token,
     }
 
     CUresult r;
-    r = cuMemcpyHtoDAsync(g_dec_x, input_embeds, (size_t)dim * sizeof(float), g_stream);
-    if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_x)", r); return 0; }
+    if (!input_on_device) {
+        r = cuMemcpyHtoDAsync(g_dec_x, input_embeds_or_null, (size_t)dim * sizeof(float), g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_x)", r); return 0; }
+    }
 
     /* RoPE freqs for this position */
     int logical_pos = ctx->kv_pos_offset + pos;
@@ -3463,6 +3654,65 @@ int vox_cuda_decoder_forward_full(int *out_token,
 
     *out_token = best;
     return 1;
+}
+
+int vox_cuda_decoder_forward_full(int *out_token,
+                                  float *logits_or_null,
+                                  vox_ctx_t *ctx,
+                                  const float *input_embeds) {
+    return vox_cuda_decoder_forward_full_impl(out_token, logits_or_null, ctx, input_embeds, 0);
+}
+
+int vox_cuda_decoder_forward_from_stream_adapter(int *out_token,
+                                                 float *logits_or_null,
+                                                 vox_ctx_t *ctx,
+                                                 int prev_token) {
+    if (!out_token) return 0;
+    *out_token = 2;
+    if (!pipeline_full_enabled()) return 0;
+    if (!vox_cuda_available()) return 0;
+
+    const char *disable = getenv("VOX_DISABLE_CUDA_DECODER_FULL");
+    if (disable && disable[0] && disable[0] != '0') return 0;
+    if (!ctx) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_stream_adapter || g_stream_adapter_len <= 0) return 0;
+    if (prev_token < 0 || prev_token >= VOX_VOCAB_SIZE) return 0;
+
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM; /* 1024 */
+
+    /* Mirror the rolling-cache policy from vox_decoder_forward(): compact instead
+     * of growing when possible. In pipeline mode we only compact device KV; the
+     * host KV cache is not required. */
+    if (ctx->kv_cache_max > 0 && ctx->kv_cache_len >= ctx->kv_cache_max) {
+        int keep = VOX_DEC_WINDOW;
+        if (ctx->kv_cache_len > keep) {
+            int discard = ctx->kv_cache_len - keep;
+            vox_cuda_kv_cache_compact(discard, keep, kv_dim, ctx->kv_cache_max);
+            ctx->kv_pos_offset += discard;
+            ctx->kv_cache_len = keep;
+        } else {
+            return 0;
+        }
+    }
+
+    int pos = ctx->kv_cache_len;
+    int logical_pos = ctx->kv_pos_offset + pos;
+    if (logical_pos < 0 || logical_pos >= g_stream_adapter_len) return 0;
+
+    (void)cuCtxSetCurrent(g_ctx);
+
+    int dim = VOX_DEC_DIM;
+    if (!ensure_buffer(&g_dec_x, &g_cap_dec_x, (size_t)dim * sizeof(float))) return 0;
+
+    /* Token embeddings matrix is BF16 [vocab, dim]. */
+    size_t bytes_emb = (size_t)VOX_VOCAB_SIZE * (size_t)dim * sizeof(uint16_t);
+    CUdeviceptr dTok = bf16_cache_get(ctx->decoder.tok_embeddings_bf16, bytes_emb);
+    if (!dTok) return 0;
+
+    if (!launch_step_embed_from_adapter(g_dec_x, g_stream_adapter, dTok, prev_token, logical_pos, dim)) return 0;
+
+    return vox_cuda_decoder_forward_full_impl(out_token, logits_or_null, ctx, NULL, 1);
 }
 
 int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
