@@ -31,6 +31,13 @@ run_case() {
     ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_WAV" --silent >/tmp/voxtral_${backend}.txt 2>/tmp/voxtral_${backend}.err
   cat /tmp/voxtral_${backend}.time
   rg --no-line-number --no-heading '^(Model load:|Wall transcribe:|Encoder:|Decoder:)' /tmp/voxtral_${backend}.err || true
+  # Some benchmark comparisons include model load in "total time". Provide an
+  # apples-to-apples derived figure without requiring external math.
+  load_ms="$(awk '/^Model load:/ {print $3}' /tmp/voxtral_${backend}.err | head -n1 || true)"
+  wall_ms="$(awk '/^Wall transcribe:/ {print $3}' /tmp/voxtral_${backend}.err | head -n1 || true)"
+  if [[ -n "${load_ms:-}" && -n "${wall_ms:-}" ]]; then
+    echo "Total (load+transcribe): $((load_ms + wall_ms)) ms"
+  fi
   echo "output_bytes=$(wc -c </tmp/voxtral_${backend}.txt)"
   echo
 }
