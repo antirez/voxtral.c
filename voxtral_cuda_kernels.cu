@@ -856,6 +856,332 @@ extern "C" __global__ void vox_attn_q4_kv8_f32_dyn_v2(float *out_q,      /* [32*
                                                       out3 * inv_sum);
 }
 
+/* v3 decoder attention kernels: chunked reduction + GQA shared-load.
+ *
+ * Motivation: the v1/v2 kernels launch 1 warp per *query head* and therefore
+ * read the same KV head 4x (since GQA: 4 query heads share 1 KV head). v3
+ * reduces redundant KV loads by having one block compute 4 query heads for a
+ * single KV head, over a fixed set of chunks (so it can be used under CUDA
+ * Graph capture when paired with a dyn variant).
+ *
+ * Structure:
+ * - partial kernel: grid=(kv_heads=8, chunks=N), block=(128 threads = 4 warps)
+ *   Each warp computes a partial online-softmax state + partial output vector
+ *   for one query head over its chunk.
+ * - reduce kernel: grid=(query_heads=32), block=(32 threads)
+ *   Combine chunk partials using standard max/sumexp rescaling.
+ *
+ * This is intentionally opt-in and tuned for head_dim=128, n_heads=32, kv_heads=8. */
+
+#define VOX_ATTN_V3_CHUNK 256
+
+extern "C" __global__ void vox_attn_q4_kv8_fp16_v3_partial(float *out_part,     /* [32*n_chunks*128] */
+                                                           float *max_part,     /* [32*n_chunks] */
+                                                           float *sum_part,     /* [32*n_chunks] */
+                                                           const float *q,       /* [32*128] */
+                                                           const __half *k_cache,/* [max_seq*8*128] */
+                                                           const __half *v_cache,/* [max_seq*8*128] */
+                                                           int total_seq,
+                                                           int window_size,
+                                                           float scale,
+                                                           int n_chunks) {
+    int kv_h = (int)blockIdx.x;       /* 0..7 */
+    int chunk = (int)blockIdx.y;      /* 0..n_chunks-1 */
+    int tid = (int)threadIdx.x;       /* 0..127 */
+    int warp = tid >> 5;              /* 0..3 */
+    int lane = tid & 31;              /* 0..31 */
+    if (kv_h >= 8 || warp >= 4) return;
+
+    int h = kv_h * 4 + warp;          /* query head 0..31 */
+
+    int end = total_seq;
+    int start = 0;
+    if (window_size > 0) {
+        int s = end - window_size;
+        if (s > 0) start = s;
+    }
+    if (start < 0) start = 0;
+    if (end < start) end = start;
+
+    /* Chunks are relative to the active attention window [start,end), not
+     * absolute token indices. This keeps the grid shape fixed (n_chunks) while
+     * sliding over long sequences. */
+    int chunk_start = start + chunk * VOX_ATTN_V3_CHUNK;
+    int chunk_end = chunk_start + VOX_ATTN_V3_CHUNK;
+    if (chunk_start > end) chunk_start = end;
+    if (chunk_end > end) chunk_end = end;
+
+    /* Outputs are stored densely by query head (h). */
+    int base_max = h * n_chunks + chunk;
+    size_t base_vec = ((size_t)base_max) * (size_t)128;
+
+    if (chunk_start >= chunk_end) {
+        /* Empty chunk: write neutral partials. */
+        if (lane == 0) {
+            max_part[base_max] = -1.0e30f;
+            sum_part[base_max] = 0.0f;
+        }
+        ((float4 *)(out_part + base_vec))[lane] = make_float4(0.f, 0.f, 0.f, 0.f);
+        return;
+    }
+
+    const float4 qv = ((const float4 *)(q + h * 128))[lane];
+
+    float max_score = -1.0e30f;
+    float sum_exp = 0.0f;
+    float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+
+    const __half2 *k2 = (const __half2 *)k_cache;
+    const __half2 *v2 = (const __half2 *)v_cache;
+    size_t row_stride = (size_t)(8 * 128) / 2;        /* 512 half2 per token */
+    size_t head_off = (size_t)kv_h * (size_t)128 / 2; /* 64 half2 per head */
+
+    __shared__ __half2 shK[64];
+    __shared__ __half2 shV[64];
+
+    int off2 = lane * 2; /* half2 index for this lane's 4 dims (2*lane,2*lane+1) */
+
+    for (int j = chunk_start; j < chunk_end; j++) {
+        const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
+        const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
+
+        if (tid < 64) {
+            shK[tid] = k_row[tid];
+        } else {
+            shV[tid - 64] = v_row[tid - 64];
+        }
+        __syncthreads();
+
+        float2 k01 = __half22float2(shK[off2 + 0]);
+        float2 k23 = __half22float2(shK[off2 + 1]);
+        float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
+        float sum = warp_reduce_sum(partial);
+        sum = __shfl_sync(0xffffffff, sum, 0);
+        float score = sum * scale;
+
+        float w = 0.0f;
+        float corr = 1.0f;
+        int new_max = 0;
+        if (lane == 0) {
+            if (score > max_score) {
+                corr = __expf(max_score - score);
+                sum_exp = sum_exp * corr + 1.0f;
+                max_score = score;
+                w = 1.0f;
+                new_max = 1;
+            } else {
+                w = __expf(score - max_score);
+                sum_exp += w;
+                corr = 1.0f;
+                new_max = 0;
+            }
+        }
+        w = __shfl_sync(0xffffffff, w, 0);
+        corr = __shfl_sync(0xffffffff, corr, 0);
+        new_max = __shfl_sync(0xffffffff, new_max, 0);
+
+        float2 v01 = __half22float2(shV[off2 + 0]);
+        float2 v23 = __half22float2(shV[off2 + 1]);
+
+        if (new_max) {
+            out0 = out0 * corr + v01.x;
+            out1 = out1 * corr + v01.y;
+            out2 = out2 * corr + v23.x;
+            out3 = out3 * corr + v23.y;
+        } else {
+            out0 += w * v01.x;
+            out1 += w * v01.y;
+            out2 += w * v23.x;
+            out3 += w * v23.y;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        max_part[base_max] = max_score;
+        sum_part[base_max] = sum_exp;
+    }
+    ((float4 *)(out_part + base_vec))[lane] = make_float4(out0, out1, out2, out3);
+}
+
+extern "C" __global__ void vox_attn_q4_kv8_fp16_dyn_v3_partial(float *out_part,      /* [32*n_chunks*128] */
+                                                               float *max_part,      /* [32*n_chunks] */
+                                                               float *sum_part,      /* [32*n_chunks] */
+                                                               const float *q,        /* [32*128] */
+                                                               const __half *k_cache, /* [max_seq*8*128] */
+                                                               const __half *v_cache, /* [max_seq*8*128] */
+                                                               const int *p_pos,
+                                                               int window_size,
+                                                               float scale,
+                                                               int n_chunks) {
+    int kv_h = (int)blockIdx.x;
+    int chunk = (int)blockIdx.y;
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    if (kv_h >= 8 || warp >= 4) return;
+
+    int h = kv_h * 4 + warp;
+
+    int pos = 0;
+    if (lane == 0) pos = *p_pos;
+    pos = __shfl_sync(0xffffffff, pos, 0);
+    int end = pos + 1;
+
+    int start = 0;
+    if (window_size > 0) {
+        int s = end - window_size;
+        if (s > 0) start = s;
+    }
+    if (start < 0) start = 0;
+    if (end < start) end = start;
+
+    /* Chunks are relative to the active attention window [start,end), not
+     * absolute token indices. This keeps the grid shape fixed (n_chunks) while
+     * sliding over long sequences. */
+    int chunk_start = start + chunk * VOX_ATTN_V3_CHUNK;
+    int chunk_end = chunk_start + VOX_ATTN_V3_CHUNK;
+    if (chunk_start > end) chunk_start = end;
+    if (chunk_end > end) chunk_end = end;
+
+    int base_max = h * n_chunks + chunk;
+    size_t base_vec = ((size_t)base_max) * (size_t)128;
+
+    if (chunk_start >= chunk_end) {
+        if (lane == 0) {
+            max_part[base_max] = -1.0e30f;
+            sum_part[base_max] = 0.0f;
+        }
+        ((float4 *)(out_part + base_vec))[lane] = make_float4(0.f, 0.f, 0.f, 0.f);
+        return;
+    }
+
+    const float4 qv = ((const float4 *)(q + h * 128))[lane];
+
+    float max_score = -1.0e30f;
+    float sum_exp = 0.0f;
+    float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+
+    const __half2 *k2 = (const __half2 *)k_cache;
+    const __half2 *v2 = (const __half2 *)v_cache;
+    size_t row_stride = (size_t)(8 * 128) / 2;
+    size_t head_off = (size_t)kv_h * (size_t)128 / 2;
+
+    __shared__ __half2 shK[64];
+    __shared__ __half2 shV[64];
+
+    int off2 = lane * 2;
+
+    for (int j = chunk_start; j < chunk_end; j++) {
+        const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
+        const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
+
+        if (tid < 64) {
+            shK[tid] = k_row[tid];
+        } else {
+            shV[tid - 64] = v_row[tid - 64];
+        }
+        __syncthreads();
+
+        float2 k01 = __half22float2(shK[off2 + 0]);
+        float2 k23 = __half22float2(shK[off2 + 1]);
+        float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
+        float sum = warp_reduce_sum(partial);
+        sum = __shfl_sync(0xffffffff, sum, 0);
+        float score = sum * scale;
+
+        float w = 0.0f;
+        float corr = 1.0f;
+        int new_max = 0;
+        if (lane == 0) {
+            if (score > max_score) {
+                corr = __expf(max_score - score);
+                sum_exp = sum_exp * corr + 1.0f;
+                max_score = score;
+                w = 1.0f;
+                new_max = 1;
+            } else {
+                w = __expf(score - max_score);
+                sum_exp += w;
+                corr = 1.0f;
+                new_max = 0;
+            }
+        }
+        w = __shfl_sync(0xffffffff, w, 0);
+        corr = __shfl_sync(0xffffffff, corr, 0);
+        new_max = __shfl_sync(0xffffffff, new_max, 0);
+
+        float2 v01 = __half22float2(shV[off2 + 0]);
+        float2 v23 = __half22float2(shV[off2 + 1]);
+        if (new_max) {
+            out0 = out0 * corr + v01.x;
+            out1 = out1 * corr + v01.y;
+            out2 = out2 * corr + v23.x;
+            out3 = out3 * corr + v23.y;
+        } else {
+            out0 += w * v01.x;
+            out1 += w * v01.y;
+            out2 += w * v23.x;
+            out3 += w * v23.y;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        max_part[base_max] = max_score;
+        sum_part[base_max] = sum_exp;
+    }
+    ((float4 *)(out_part + base_vec))[lane] = make_float4(out0, out1, out2, out3);
+}
+
+extern "C" __global__ void vox_attn_q4_kv8_fp16_v3_reduce(float *out_q,           /* [32*128] */
+                                                          const float *out_part, /* [32*n_chunks*128] */
+                                                          const float *max_part, /* [32*n_chunks] */
+                                                          const float *sum_part, /* [32*n_chunks] */
+                                                          int n_chunks) {
+    int h = (int)blockIdx.x;
+    int lane = (int)threadIdx.x;
+    if (h >= 32 || lane >= 32) return;
+
+    /* Find global max for this head across chunks. */
+    float m = -1.0e30f;
+    if (lane == 0) {
+        for (int c = 0; c < n_chunks; c++) {
+            float mc = max_part[h * n_chunks + c];
+            if (mc > m) m = mc;
+        }
+    }
+    m = __shfl_sync(0xffffffff, m, 0);
+
+    /* Compute global sumexp (lane 0) and weighted sum vector (all lanes). */
+    float4 acc4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    float sum = 0.0f;
+    for (int c = 0; c < n_chunks; c++) {
+        int idx = h * n_chunks + c;
+        float mc = max_part[idx];
+        float sc = sum_part[idx];
+        float scale = __expf(mc - m);
+
+        if (lane == 0) sum += sc * scale;
+
+        size_t base_vec = ((size_t)idx) * (size_t)128;
+        float4 v4 = ((const float4 *)(out_part + base_vec))[lane];
+        acc4.x += v4.x * scale;
+        acc4.y += v4.y * scale;
+        acc4.z += v4.z * scale;
+        acc4.w += v4.w * scale;
+    }
+
+    float inv_sum = 0.0f;
+    if (lane == 0) inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+    inv_sum = __shfl_sync(0xffffffff, inv_sum, 0);
+
+    ((float4 *)(out_q + h * 128))[lane] = make_float4(acc4.x * inv_sum,
+                                                      acc4.y * inv_sum,
+                                                      acc4.z * inv_sum,
+                                                      acc4.w * inv_sum);
+}
+
 extern "C" __global__ void vox_causal_attn_f32(float *out,
                                                const float *Q,
                                                const float *K,

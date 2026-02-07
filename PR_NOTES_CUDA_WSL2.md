@@ -27,6 +27,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - Device-side KV cache (FP16 by default) and device-only intermediates.
   - Faster per-token attention kernel (online softmax, warp-synchronous).
   - Optional attention v2 kernel variant (vectorized loads/stores; opt-in).
+  - Optional attention v3 kernel variant (chunked reduction + GQA shared-load; opt-in).
   - Optional CUDA Graph capture for the single-token decoder step (reduces CPU launch overhead; opt-in).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
   - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
@@ -118,6 +119,23 @@ On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), the v2 
 - Without graphs: decoder `19.2 -> 19.0 ms/step`, `Wall transcribe 17531 -> 17439 ms`
 - With graphs: decoder `18.2 -> 18.1 ms/step`, `Wall transcribe 16772 -> 16719 ms`
 
+### Attention v3 (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_ATTN_V3=1
+```
+
+Notes:
+- v3 is currently implemented for FP16 KV cache only (`VOX_CUDA_KV_FP16=1`, which is the default).
+- v3 uses a 2-stage chunked reduction and reduces redundant KV loads under GQA by having one block compute 4 query heads that share the same KV head.
+
+On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), v3 is a clear win (numbers from `./runtest.sh`):
+
+- Without graphs: decoder `19.6 -> 15.0 ms/step` (`16282 -> 12811 ms` total decoder time)
+- With graphs: decoder `18.2 -> 13.8 ms/step` (`~11860 ms` total decoder time)
+
 ### `samples/I_have_a_dream.ogg` (180s)
 
 Convert once:
@@ -173,3 +191,7 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_CUDA_ATTN_V2=1`
 - Disable attention v2 kernel variant (force v1):
   - `VOX_DISABLE_CUDA_ATTN_V2=1`
+- Enable attention v3 kernel variant (opt-in):
+  - `VOX_CUDA_ATTN_V3=1`
+- Disable attention v3 kernel variant (force v1/v2):
+  - `VOX_DISABLE_CUDA_ATTN_V3=1`
