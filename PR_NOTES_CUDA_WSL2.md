@@ -21,7 +21,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - Host BF16 pointers (mmap-backed) are used as stable cache keys.
   - Device cache is LRU-ish and sized conservatively based on free VRAM.
 - Encoder full path:
-  - CPU conv stem remains on CPU (small).
+  - CPU conv stem remains on CPU by default (small); optional GPU conv stem is available (opt-in).
   - Transformer layers + adapter run on GPU; intermediates stay on device.
 - Decoder full path:
   - Device-side KV cache (FP16 by default) and device-only intermediates.
@@ -130,11 +130,22 @@ VOX_CUDA_ATTN_V3=1
 Notes:
 - v3 is currently implemented for FP16 KV cache only (`VOX_CUDA_KV_FP16=1`, which is the default).
 - v3 uses a 2-stage chunked reduction and reduces redundant KV loads under GQA by having one block compute 4 query heads that share the same KV head.
+- When CUDA Graphs are enabled (`VOX_CUDA_GRAPHS=1`), v3 is auto-selected for the graph capture path if available (unless disabled via `VOX_DISABLE_CUDA_ATTN_V3=1`).
 
 On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), v3 is a clear win (numbers from `./runtest.sh`):
 
-- Without graphs: decoder `19.6 -> 15.0 ms/step` (`16282 -> 12811 ms` total decoder time)
-- With graphs: decoder `18.2 -> 13.8 ms/step` (`~11860 ms` total decoder time)
+- Without graphs: decoder `19.6 -> 14.8 ms/step` (`16254 -> 12594 ms` total decoder time)
+- With graphs: decoder `18.6 -> 13.7 ms/step` (`15537 -> 11776 ms` total decoder time)
+
+### GPU Conv Stem (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_CONV_STEM=1
+```
+
+This runs the encoder conv stem (conv0/conv1 + GELU) on GPU via custom CUDA kernels + cuBLAS SGEMM (no cuDNN). It mainly reduces CPU-side `im2col` overhead in the encoder front-end.
 
 ### `samples/I_have_a_dream.ogg` (180s)
 
@@ -195,3 +206,7 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_CUDA_ATTN_V3=1`
 - Disable attention v3 kernel variant (force v1/v2):
   - `VOX_DISABLE_CUDA_ATTN_V3=1`
+- Enable GPU conv stem (opt-in):
+  - `VOX_CUDA_CONV_STEM=1`
+- Disable GPU conv stem (force CPU conv stem):
+  - `VOX_DISABLE_CUDA_CONV_STEM=1`

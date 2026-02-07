@@ -874,6 +874,7 @@ extern "C" __global__ void vox_attn_q4_kv8_f32_dyn_v2(float *out_q,      /* [32*
  * This is intentionally opt-in and tuned for head_dim=128, n_heads=32, kv_heads=8. */
 
 #define VOX_ATTN_V3_CHUNK 256
+#define VOX_ATTN_V3_TILE 4
 
 extern "C" __global__ void vox_attn_q4_kv8_fp16_v3_partial(float *out_part,     /* [32*n_chunks*128] */
                                                            float *max_part,     /* [32*n_chunks] */
@@ -936,63 +937,72 @@ extern "C" __global__ void vox_attn_q4_kv8_fp16_v3_partial(float *out_part,     
     size_t row_stride = (size_t)(8 * 128) / 2;        /* 512 half2 per token */
     size_t head_off = (size_t)kv_h * (size_t)128 / 2; /* 64 half2 per head */
 
-    __shared__ __half2 shK[64];
-    __shared__ __half2 shV[64];
+    __shared__ __half2 shK[VOX_ATTN_V3_TILE][64];
+    __shared__ __half2 shV[VOX_ATTN_V3_TILE][64];
 
     int off2 = lane * 2; /* half2 index for this lane's 4 dims (2*lane,2*lane+1) */
 
-    for (int j = chunk_start; j < chunk_end; j++) {
-        const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
-        const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
-
-        if (tid < 64) {
-            shK[tid] = k_row[tid];
-        } else {
-            shV[tid - 64] = v_row[tid - 64];
+    for (int j0 = chunk_start; j0 < chunk_end; j0 += VOX_ATTN_V3_TILE) {
+#pragma unroll
+        for (int t = 0; t < VOX_ATTN_V3_TILE; t++) {
+            int j = j0 + t;
+            if (j >= chunk_end) continue;
+            const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
+            const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
+            if (tid < 64) {
+                shK[t][tid] = k_row[tid];
+            } else {
+                shV[t][tid - 64] = v_row[tid - 64];
+            }
         }
         __syncthreads();
 
-        float2 k01 = __half22float2(shK[off2 + 0]);
-        float2 k23 = __half22float2(shK[off2 + 1]);
-        float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
-        float sum = warp_reduce_sum(partial);
-        sum = __shfl_sync(0xffffffff, sum, 0);
-        float score = sum * scale;
+#pragma unroll
+        for (int t = 0; t < VOX_ATTN_V3_TILE; t++) {
+            int j = j0 + t;
+            if (j >= chunk_end) break;
 
-        float w = 0.0f;
-        float corr = 1.0f;
-        int new_max = 0;
-        if (lane == 0) {
-            if (score > max_score) {
-                corr = __expf(max_score - score);
-                sum_exp = sum_exp * corr + 1.0f;
-                max_score = score;
-                w = 1.0f;
-                new_max = 1;
-            } else {
-                w = __expf(score - max_score);
-                sum_exp += w;
-                corr = 1.0f;
-                new_max = 0;
+            float2 k01 = __half22float2(shK[t][off2 + 0]);
+            float2 k23 = __half22float2(shK[t][off2 + 1]);
+            float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
+            float sum = warp_reduce_sum(partial);
+            sum = __shfl_sync(0xffffffff, sum, 0);
+            float score = sum * scale;
+
+            float w = 0.0f;
+            float corr = 1.0f;
+            int new_max = 0;
+            if (lane == 0) {
+                if (score > max_score) {
+                    corr = __expf(max_score - score);
+                    sum_exp = sum_exp * corr + 1.0f;
+                    max_score = score;
+                    w = 1.0f;
+                    new_max = 1;
+                } else {
+                    w = __expf(score - max_score);
+                    sum_exp += w;
+                    corr = 1.0f;
+                    new_max = 0;
+                }
             }
-        }
-        w = __shfl_sync(0xffffffff, w, 0);
-        corr = __shfl_sync(0xffffffff, corr, 0);
-        new_max = __shfl_sync(0xffffffff, new_max, 0);
+            w = __shfl_sync(0xffffffff, w, 0);
+            corr = __shfl_sync(0xffffffff, corr, 0);
+            new_max = __shfl_sync(0xffffffff, new_max, 0);
 
-        float2 v01 = __half22float2(shV[off2 + 0]);
-        float2 v23 = __half22float2(shV[off2 + 1]);
-
-        if (new_max) {
-            out0 = out0 * corr + v01.x;
-            out1 = out1 * corr + v01.y;
-            out2 = out2 * corr + v23.x;
-            out3 = out3 * corr + v23.y;
-        } else {
-            out0 += w * v01.x;
-            out1 += w * v01.y;
-            out2 += w * v23.x;
-            out3 += w * v23.y;
+            float2 v01 = __half22float2(shV[t][off2 + 0]);
+            float2 v23 = __half22float2(shV[t][off2 + 1]);
+            if (new_max) {
+                out0 = out0 * corr + v01.x;
+                out1 = out1 * corr + v01.y;
+                out2 = out2 * corr + v23.x;
+                out3 = out3 * corr + v23.y;
+            } else {
+                out0 += w * v01.x;
+                out1 += w * v01.y;
+                out2 += w * v23.x;
+                out3 += w * v23.y;
+            }
         }
         __syncthreads();
     }
@@ -1067,62 +1077,72 @@ extern "C" __global__ void vox_attn_q4_kv8_fp16_dyn_v3_partial(float *out_part, 
     size_t row_stride = (size_t)(8 * 128) / 2;
     size_t head_off = (size_t)kv_h * (size_t)128 / 2;
 
-    __shared__ __half2 shK[64];
-    __shared__ __half2 shV[64];
+    __shared__ __half2 shK[VOX_ATTN_V3_TILE][64];
+    __shared__ __half2 shV[VOX_ATTN_V3_TILE][64];
 
     int off2 = lane * 2;
 
-    for (int j = chunk_start; j < chunk_end; j++) {
-        const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
-        const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
-
-        if (tid < 64) {
-            shK[tid] = k_row[tid];
-        } else {
-            shV[tid - 64] = v_row[tid - 64];
+    for (int j0 = chunk_start; j0 < chunk_end; j0 += VOX_ATTN_V3_TILE) {
+#pragma unroll
+        for (int t = 0; t < VOX_ATTN_V3_TILE; t++) {
+            int j = j0 + t;
+            if (j >= chunk_end) continue;
+            const __half2 *k_row = k2 + (size_t)j * row_stride + head_off;
+            const __half2 *v_row = v2 + (size_t)j * row_stride + head_off;
+            if (tid < 64) {
+                shK[t][tid] = k_row[tid];
+            } else {
+                shV[t][tid - 64] = v_row[tid - 64];
+            }
         }
         __syncthreads();
 
-        float2 k01 = __half22float2(shK[off2 + 0]);
-        float2 k23 = __half22float2(shK[off2 + 1]);
-        float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
-        float sum = warp_reduce_sum(partial);
-        sum = __shfl_sync(0xffffffff, sum, 0);
-        float score = sum * scale;
+#pragma unroll
+        for (int t = 0; t < VOX_ATTN_V3_TILE; t++) {
+            int j = j0 + t;
+            if (j >= chunk_end) break;
 
-        float w = 0.0f;
-        float corr = 1.0f;
-        int new_max = 0;
-        if (lane == 0) {
-            if (score > max_score) {
-                corr = __expf(max_score - score);
-                sum_exp = sum_exp * corr + 1.0f;
-                max_score = score;
-                w = 1.0f;
-                new_max = 1;
-            } else {
-                w = __expf(score - max_score);
-                sum_exp += w;
-                corr = 1.0f;
-                new_max = 0;
+            float2 k01 = __half22float2(shK[t][off2 + 0]);
+            float2 k23 = __half22float2(shK[t][off2 + 1]);
+            float partial = qv.x * k01.x + qv.y * k01.y + qv.z * k23.x + qv.w * k23.y;
+            float sum = warp_reduce_sum(partial);
+            sum = __shfl_sync(0xffffffff, sum, 0);
+            float score = sum * scale;
+
+            float w = 0.0f;
+            float corr = 1.0f;
+            int new_max = 0;
+            if (lane == 0) {
+                if (score > max_score) {
+                    corr = __expf(max_score - score);
+                    sum_exp = sum_exp * corr + 1.0f;
+                    max_score = score;
+                    w = 1.0f;
+                    new_max = 1;
+                } else {
+                    w = __expf(score - max_score);
+                    sum_exp += w;
+                    corr = 1.0f;
+                    new_max = 0;
+                }
             }
-        }
-        w = __shfl_sync(0xffffffff, w, 0);
-        corr = __shfl_sync(0xffffffff, corr, 0);
-        new_max = __shfl_sync(0xffffffff, new_max, 0);
+            w = __shfl_sync(0xffffffff, w, 0);
+            corr = __shfl_sync(0xffffffff, corr, 0);
+            new_max = __shfl_sync(0xffffffff, new_max, 0);
 
-        float2 v01 = __half22float2(shV[off2 + 0]);
-        float2 v23 = __half22float2(shV[off2 + 1]);
-        if (new_max) {
-            out0 = out0 * corr + v01.x;
-            out1 = out1 * corr + v01.y;
-            out2 = out2 * corr + v23.x;
-            out3 = out3 * corr + v23.y;
-        } else {
-            out0 += w * v01.x;
-            out1 += w * v01.y;
-            out2 += w * v23.x;
-            out3 += w * v23.y;
+            float2 v01 = __half22float2(shV[t][off2 + 0]);
+            float2 v23 = __half22float2(shV[t][off2 + 1]);
+            if (new_max) {
+                out0 = out0 * corr + v01.x;
+                out1 = out1 * corr + v01.y;
+                out2 = out2 * corr + v23.x;
+                out3 = out3 * corr + v23.y;
+            } else {
+                out0 += w * v01.x;
+                out1 += w * v01.y;
+                out2 += w * v23.x;
+                out3 += w * v23.y;
+            }
         }
         __syncthreads();
     }
@@ -1533,6 +1553,100 @@ extern "C" __global__ void vox_gelu_inplace_f32(float *x, int n) {
     float x3 = v * v * v;
     float inner = 0.7978845608028654f * (v + 0.044715f * x3);
     x[idx] = 0.5f * v * (1.0f + tanhf(inner));
+}
+
+/* ========================================================================
+ * Encoder Conv Stem Helpers (CUDA, optional)
+ * ======================================================================== */
+
+/* Build im2col for the encoder conv stem conv0:
+ * - causal conv1d, k=3, stride=1 (left_pad=2)
+ * - input is mel in row-major [length, 128]
+ * - output is im2col in row-major [K=128*3, out_len=length]
+ *
+ * Matches vox_causal_conv1d() indexing:
+ * im2col[ic*3 + k, ol] = mel[ol - 2 + k, ic] (0 if OOB)
+ */
+extern "C" __global__ void vox_im2col_causal_k3_s1_mel_f32(float *dst,
+                                                           const float *mel,
+                                                           int length) {
+    int out_len = length;
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = (128 * 3) * out_len;
+    if (idx >= total) return;
+
+    int row = idx / out_len; /* 0..383 */
+    int ol = idx - row * out_len;
+    int ic = row / 3;
+    int k = row - ic * 3;
+    int il = ol - 2 + k;
+
+    float v = 0.0f;
+    if (il >= 0 && il < length) {
+        v = mel[(size_t)il * 128u + (size_t)ic];
+    }
+    dst[(size_t)row * (size_t)out_len + (size_t)ol] = v;
+}
+
+/* Build im2col for the encoder conv stem conv1:
+ * - causal conv1d, k=3, stride=2 (left_pad=1)
+ * - input is channel-first row-major [channels, length]
+ * - output is im2col row-major [K=channels*3, out_len]
+ *
+ * im2col[ic*3 + k, ol] = in[ic, ol*2 - 1 + k] (0 if OOB)
+ */
+extern "C" __global__ void vox_im2col_causal_k3_s2_f32(float *dst,
+                                                       const float *in,
+                                                       int channels,
+                                                       int length,
+                                                       int out_len) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int K = channels * 3;
+    int total = K * out_len;
+    if (idx >= total) return;
+
+    int row = idx / out_len; /* 0..K-1 */
+    int ol = idx - row * out_len;
+    int ic = row / 3;
+    int k = row - ic * 3;
+    int il = ol * 2 - 1 + k;
+
+    float v = 0.0f;
+    if (il >= 0 && il < length) {
+        v = in[(size_t)ic * (size_t)length + (size_t)il];
+    }
+    dst[(size_t)row * (size_t)out_len + (size_t)ol] = v;
+}
+
+/* x is channel-first row-major [channels, length]. Applies:
+ *   x = GELU(x + bias[channel])
+ */
+extern "C" __global__ void vox_add_bias_gelu_chfirst_f32(float *x,
+                                                         const float *bias,
+                                                         int channels,
+                                                         int length) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = channels * length;
+    if (idx >= total) return;
+    int c = idx / length;
+    float v = x[idx] + bias[c];
+    float x3 = v * v * v;
+    float inner = 0.7978845608028654f * (v + 0.044715f * x3);
+    x[idx] = 0.5f * v * (1.0f + tanhf(inner));
+}
+
+/* Convert channel-first row-major [channels, length] to time-major row-major
+ * [length, channels]. This is effectively a transpose. */
+extern "C" __global__ void vox_chfirst_to_rowmajor_f32(float *dst,
+                                                       const float *src,
+                                                       int channels,
+                                                       int length) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = channels * length;
+    if (idx >= total) return;
+    int c = idx / length;
+    int t = idx - c * length;
+    dst[(size_t)t * (size_t)channels + (size_t)c] = src[(size_t)c * (size_t)length + (size_t)t];
 }
 
 extern "C" __global__ void vox_f32_to_bf16(uint16_t *dst,

@@ -20,6 +20,18 @@ fi
 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_smoke.txt
 printf "[ok] CUDA smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_smoke.txt)"
 
+# CUDA Graph smoke (opt-in). Also validates the graph capture path.
+VOX_CUDA_GRAPHS=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_graph_smoke.txt
+printf "[ok] CUDA graphs smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_graph_smoke.txt)"
+
+# Graphs + force-disable attention v3 (should still run; falls back to v2/v1).
+VOX_CUDA_GRAPHS=1 VOX_DISABLE_CUDA_ATTN_V3=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_graph_nov3_smoke.txt
+printf "[ok] CUDA graphs (no v3) smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_graph_nov3_smoke.txt)"
+
+# Optional GPU conv stem smoke (encoder front-end).
+VOX_CUDA_CONV_STEM=1 ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_FILE" --silent >/tmp/voxtral_cuda_conv_stem_smoke.txt
+printf "[ok] CUDA conv-stem smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_conv_stem_smoke.txt)"
+
 # stdin smoke
 cat "$SAMPLE_FILE" | ./voxtral -d "$MODEL_DIR" --stdin --silent >/tmp/voxtral_cuda_stdin_smoke.txt
 printf "[ok] CUDA stdin smoke output bytes: %s\n" "$(wc -c </tmp/voxtral_cuda_stdin_smoke.txt)"
