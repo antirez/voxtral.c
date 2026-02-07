@@ -63,6 +63,10 @@ static size_t g_lt_workspace_cap = 0;
 typedef struct {
     int M, K, N;
     cublasLtMatmulAlgo_t algo;
+    cublasLtMatmulDesc_t op;
+    cublasLtMatrixLayout_t a;
+    cublasLtMatrixLayout_t b;
+    cublasLtMatrixLayout_t c;
     size_t workspace_bytes;
     int valid;
 } lt_algo_entry_t;
@@ -842,8 +846,16 @@ static int ensure_lt_workspace(size_t needed_bytes) {
 
 static int lt_get_algo_t_bf16(int M, int K, int N,
                               cublasLtMatmulAlgo_t *out_algo,
-                              size_t *out_ws) {
+                              size_t *out_ws,
+                              cublasLtMatmulDesc_t *out_op,
+                              cublasLtMatrixLayout_t *out_a,
+                              cublasLtMatrixLayout_t *out_b,
+                              cublasLtMatrixLayout_t *out_c) {
     if (!out_algo || !out_ws) return 0;
+    if (out_op) *out_op = NULL;
+    if (out_a) *out_a = NULL;
+    if (out_b) *out_b = NULL;
+    if (out_c) *out_c = NULL;
     if (!g_lt_handle) return 0;
 
     for (int i = 0; i < g_lt_algos_len; i++) {
@@ -853,6 +865,10 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
             g_lt_algos[i].N == N) {
             *out_algo = g_lt_algos[i].algo;
             *out_ws = g_lt_algos[i].workspace_bytes;
+            if (out_op) *out_op = g_lt_algos[i].op;
+            if (out_a) *out_a = g_lt_algos[i].a;
+            if (out_b) *out_b = g_lt_algos[i].b;
+            if (out_c) *out_c = g_lt_algos[i].c;
             return 1;
         }
     }
@@ -908,16 +924,23 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
         g_lt_algos[g_lt_algos_len++] = (lt_algo_entry_t){
             .M = M, .K = K, .N = N,
             .algo = heur.algo,
+            .op = op,
+            .a = a,
+            .b = b,
+            .c = c,
             .workspace_bytes = heur.workspaceSize,
             .valid = 1,
         };
+        if (out_op) *out_op = op;
+        if (out_a) *out_a = a;
+        if (out_b) *out_b = b;
+        if (out_c) *out_c = c;
+        /* Descriptors are now owned by the cache; do not destroy here. */
+        op = NULL;
+        a = b = c = NULL;
     }
 
     cublasLtMatmulPreferenceDestroy(pref);
-    cublasLtMatrixLayoutDestroy(a);
-    cublasLtMatrixLayoutDestroy(b);
-    cublasLtMatrixLayoutDestroy(c);
-    cublasLtMatmulDescDestroy(op);
     return 1;
 
 fail:
@@ -942,54 +965,25 @@ static int gemm_t_bf16_bf16_f32(CUdeviceptr dC,
     if (g_lt_handle && M == 1 && (!no_lt || !no_lt[0] || no_lt[0] == '0')) {
         cublasLtMatmulAlgo_t algo;
         size_t ws = 0;
-        if (lt_get_algo_t_bf16(M, K, N, &algo, &ws) && ensure_lt_workspace(ws)) {
-            cublasLtMatmulDesc_t op = NULL;
-            cublasLtMatrixLayout_t a = NULL, b = NULL, c = NULL;
-
-            cublasStatus_t st = cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-            if (st != CUBLAS_STATUS_SUCCESS) goto lt_fail;
-
-            cublasOperation_t transa = CUBLAS_OP_N;
-            cublasOperation_t transb = CUBLAS_OP_T;
-            (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
-            (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
-
-            st = cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, M, K, K);
-            if (st != CUBLAS_STATUS_SUCCESS) goto lt_fail;
-            st = cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, N, K, K);
-            if (st != CUBLAS_STATUS_SUCCESS) goto lt_fail;
-            st = cublasLtMatrixLayoutCreate(&c, CUDA_R_32F, M, N, N);
-            if (st != CUBLAS_STATUS_SUCCESS) goto lt_fail;
-
-            cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-            (void)cublasLtMatrixLayoutSetAttribute(a, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
-            (void)cublasLtMatrixLayoutSetAttribute(b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
-            (void)cublasLtMatrixLayoutSetAttribute(c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
-
+        cublasLtMatmulDesc_t op = NULL;
+        cublasLtMatrixLayout_t a = NULL, b = NULL, c = NULL;
+        if (lt_get_algo_t_bf16(M, K, N, &algo, &ws, &op, &a, &b, &c) &&
+            op && a && b && c &&
+            ensure_lt_workspace(ws)) {
             const float alpha = 1.0f;
             const float beta = 0.0f;
-            st = cublasLtMatmul(g_lt_handle,
-                                op,
-                                &alpha,
-                                (const void *)(uintptr_t)dA_bf16, a,
-                                (const void *)(uintptr_t)dB_bf16, b,
-                                &beta,
-                                (const void *)(uintptr_t)dC, c,
-                                (void *)(uintptr_t)dC, c,
-                                &algo,
-                                (void *)(uintptr_t)g_lt_workspace, ws,
-                                (cudaStream_t)g_stream);
-            if (op) cublasLtMatmulDescDestroy(op);
-            if (a) cublasLtMatrixLayoutDestroy(a);
-            if (b) cublasLtMatrixLayoutDestroy(b);
-            if (c) cublasLtMatrixLayoutDestroy(c);
+            cublasStatus_t st = cublasLtMatmul(g_lt_handle,
+                                               op,
+                                               &alpha,
+                                               (const void *)(uintptr_t)dA_bf16, a,
+                                               (const void *)(uintptr_t)dB_bf16, b,
+                                               &beta,
+                                               (const void *)(uintptr_t)dC, c,
+                                               (void *)(uintptr_t)dC, c,
+                                               &algo,
+                                               (void *)(uintptr_t)g_lt_workspace, ws,
+                                               (cudaStream_t)g_stream);
             if (st == CUBLAS_STATUS_SUCCESS) return 1;
-
-lt_fail:
-            if (op) cublasLtMatmulDescDestroy(op);
-            if (a) cublasLtMatrixLayoutDestroy(a);
-            if (b) cublasLtMatrixLayoutDestroy(b);
-            if (c) cublasLtMatrixLayoutDestroy(c);
             /* Fall through to cuBLAS GEMMEx. */
         }
     }
@@ -1266,6 +1260,17 @@ void vox_cuda_shutdown(void) {
     if (g_lt_workspace) cuMemFree(g_lt_workspace);
     g_lt_workspace = 0;
     g_lt_workspace_cap = 0;
+    for (int i = 0; i < g_lt_algos_len; i++) {
+        if (g_lt_algos[i].op) cublasLtMatmulDescDestroy(g_lt_algos[i].op);
+        if (g_lt_algos[i].a) cublasLtMatrixLayoutDestroy(g_lt_algos[i].a);
+        if (g_lt_algos[i].b) cublasLtMatrixLayoutDestroy(g_lt_algos[i].b);
+        if (g_lt_algos[i].c) cublasLtMatrixLayoutDestroy(g_lt_algos[i].c);
+        g_lt_algos[i].op = NULL;
+        g_lt_algos[i].a = NULL;
+        g_lt_algos[i].b = NULL;
+        g_lt_algos[i].c = NULL;
+        g_lt_algos[i].valid = 0;
+    }
     g_lt_algos_len = 0;
 
     if (g_dQ) cuMemFree(g_dQ);
@@ -1529,6 +1534,46 @@ void vox_cuda_kv_cache_append_block(int layer, int start_pos, int seq_len,
         (void)cuMemcpyHtoDAsync(dk, k, bytes, g_stream);
         (void)cuMemcpyHtoDAsync(dv, v, bytes, g_stream);
     }
+}
+
+static int vox_cuda_kv_cache_append_block_dev(int layer, int start_pos, int seq_len,
+                                              int kv_dim, int window_size,
+                                              CUdeviceptr dK_f32, CUdeviceptr dV_f32) {
+    if (!vox_cuda_available()) return 0;
+    if (!dK_f32 || !dV_f32) return 0;
+    if (layer < 0 || layer >= VOX_DEC_LAYERS) return 0;
+    if (start_pos < 0 || seq_len <= 0) return 0;
+    if (kv_dim <= 0) return 0;
+
+    (void)cuCtxSetCurrent(g_ctx);
+
+    int max_seq = g_kv_max_seq;
+    if (max_seq <= 0) {
+        max_seq = window_size + 2048;
+        if (max_seq < 10240) max_seq = 10240;
+    }
+    if (!ensure_kv_cache(max_seq, kv_dim)) return 0;
+
+    size_t eb = g_kv_elem_bytes ? g_kv_elem_bytes : sizeof(float);
+    size_t layer_stride = (size_t)g_kv_max_seq * (size_t)kv_dim * eb;
+    size_t off = (size_t)start_pos * (size_t)kv_dim * eb;
+    CUdeviceptr dk = g_k_cache + (size_t)layer * layer_stride + off;
+    CUdeviceptr dv = g_v_cache + (size_t)layer * layer_stride + off;
+
+    if (kv_cache_use_fp16()) {
+        int n = seq_len * kv_dim;
+        if (!launch_f32_to_f16(dk, dK_f32, n)) return 0;
+        if (!launch_f32_to_f16(dv, dV_f32, n)) return 0;
+        return 1;
+    }
+
+    size_t bytes = (size_t)seq_len * (size_t)kv_dim * sizeof(float);
+    CUresult r;
+    r = cuMemcpyDtoDAsync(dk, dK_f32, bytes, g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuMemcpyDtoDAsync(k_block)", r); return 0; }
+    r = cuMemcpyDtoDAsync(dv, dV_f32, bytes, g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuMemcpyDtoDAsync(v_block)", r); return 0; }
+    return 1;
 }
 
 int vox_cuda_attention_step(float *attn_out,
@@ -2432,6 +2477,185 @@ int vox_cuda_decoder_forward_full(int *out_token,
     return 1;
 }
 
+int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
+                                  const float *input_embeds,
+                                  int seq_len,
+                                  const float *rope_freqs) {
+    if (!vox_cuda_available()) return 0;
+    const char *disable = getenv("VOX_DISABLE_CUDA_PREFILL");
+    if (disable && disable[0] && disable[0] != '0') return 0;
+    if (!ctx || !input_embeds || !rope_freqs) return 0;
+    if (seq_len <= 0) return 0;
+    if (!ctx->kv_cache_k || !ctx->kv_cache_v) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+
+    /* Ensure our primary context is current on this thread. */
+    (void)cuCtxSetCurrent(g_ctx);
+
+    int dim = VOX_DEC_DIM;
+    int n_heads = VOX_DEC_HEADS;
+    int n_kv_heads = VOX_DEC_KV_HEADS;
+    int head_dim = VOX_DEC_HEAD_DIM;
+    int hidden = VOX_DEC_HIDDEN;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    int start_pos = ctx->kv_cache_len;
+    if (start_pos != 0) {
+        /* Keep first implementation simple: we only support prefill from an
+         * empty cache (the streaming path resets ctx->kv_cache_len=0). */
+        return 0;
+    }
+
+    int want_max_seq = ctx->kv_cache_max > 0 ? ctx->kv_cache_max : (VOX_DEC_WINDOW + 2048);
+    if (!ensure_kv_cache(want_max_seq, kv_dim)) return 0;
+
+    /* Resize work buffers for seq_len. */
+    size_t bytes_x = (size_t)seq_len * (size_t)dim * sizeof(float);
+    size_t bytes_x_bf16 = (size_t)seq_len * (size_t)dim * sizeof(uint16_t);
+    size_t bytes_q = (size_t)seq_len * (size_t)q_dim * sizeof(float);
+    size_t bytes_kv = (size_t)seq_len * (size_t)kv_dim * sizeof(float);
+    size_t bytes_attn = bytes_q;
+    size_t bytes_attn_bf16 = (size_t)seq_len * (size_t)q_dim * sizeof(uint16_t);
+    size_t bytes_gate = (size_t)seq_len * (size_t)hidden * sizeof(float);
+    size_t bytes_gate_bf16 = (size_t)seq_len * (size_t)hidden * sizeof(uint16_t);
+    size_t bytes_rope = (size_t)seq_len * (size_t)((head_dim / 2) * 2) * sizeof(float);
+
+    if (!ensure_buffer(&g_dec_x, &g_cap_dec_x, bytes_x) ||
+        !ensure_buffer(&g_dec_x_norm, &g_cap_dec_x_norm, bytes_x) ||
+        !ensure_buffer(&g_dec_x_bf16, &g_cap_dec_x_bf16, bytes_x_bf16) ||
+        !ensure_buffer(&g_dec_q, &g_cap_dec_q, bytes_q) ||
+        !ensure_buffer(&g_dec_k, &g_cap_dec_k, bytes_kv) ||
+        !ensure_buffer(&g_dec_v, &g_cap_dec_v, bytes_kv) ||
+        !ensure_buffer(&g_dec_attn, &g_cap_dec_attn, bytes_attn) ||
+        !ensure_buffer(&g_dec_attn_bf16, &g_cap_dec_attn_bf16, bytes_attn_bf16) ||
+        !ensure_buffer(&g_dec_proj, &g_cap_dec_proj, bytes_x) ||
+        !ensure_buffer(&g_dec_gate, &g_cap_dec_gate, bytes_gate) ||
+        !ensure_buffer(&g_dec_up, &g_cap_dec_up, bytes_gate) ||
+        !ensure_buffer(&g_dec_gate_bf16, &g_cap_dec_gate_bf16, bytes_gate_bf16) ||
+        !ensure_buffer(&g_dec_ffn, &g_cap_dec_ffn, bytes_x) ||
+        !ensure_buffer(&g_dec_rope_freqs, &g_cap_dec_rope, bytes_rope)) {
+        return 0;
+    }
+
+    CUresult r;
+    r = cuMemcpyHtoDAsync(g_dec_x, input_embeds, bytes_x, g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_prefill_x)", r); return 0; }
+
+    r = cuMemcpyHtoDAsync(g_dec_rope_freqs, rope_freqs, bytes_rope, g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("HtoD(dec_prefill_rope)", r); return 0; }
+
+    static int logged = 0;
+    if (!logged && vox_verbose >= 1) {
+        fprintf(stderr, "[cuda] decoder prefill enabled (seq_len=%d)\n", seq_len);
+        logged = 1;
+    }
+
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    vox_decoder_t *dec = &ctx->decoder;
+
+    for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
+        vox_dec_layer_t *l = &dec->layers[layer];
+
+        CUdeviceptr d_attn_norm = f32_cache_get(l->attention_norm, (size_t)dim * sizeof(float));
+        CUdeviceptr d_ffn_norm = f32_cache_get(l->ffn_norm, (size_t)dim * sizeof(float));
+        if (!d_attn_norm || !d_ffn_norm) return 0;
+
+        /* ---- Self-attention ---- */
+        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
+        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
+
+        /* Q, K, V projections (no bias in decoder, bf16 weights) */
+        size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
+        size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
+        CUdeviceptr dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+        CUdeviceptr dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+        CUdeviceptr dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+        if (!dWq || !dWk || !dWv) return 0;
+
+        if (!gemm_t_bf16_bf16_f32(g_dec_q, g_dec_x_bf16, dWq, seq_len, dim, q_dim)) return 0;
+        if (!gemm_t_bf16_bf16_f32(g_dec_k, g_dec_x_bf16, dWk, seq_len, dim, kv_dim)) return 0;
+        if (!gemm_t_bf16_bf16_f32(g_dec_v, g_dec_x_bf16, dWv, seq_len, dim, kv_dim)) return 0;
+
+        /* Apply RoPE */
+        if (!launch_apply_rope(g_dec_q, g_dec_rope_freqs, seq_len, n_heads, head_dim)) return 0;
+        if (!launch_apply_rope(g_dec_k, g_dec_rope_freqs, seq_len, n_kv_heads, head_dim)) return 0;
+
+        /* Store K, V in device KV cache for the upcoming single-token decode loop. */
+        if (!vox_cuda_kv_cache_append_block_dev(layer, start_pos, seq_len, kv_dim, VOX_DEC_WINDOW,
+                                                g_dec_k, g_dec_v)) {
+            return 0;
+        }
+
+        /* Keep host KV cache in sync (for CPU fallback and for compactions). */
+        size_t host_stride = (size_t)ctx->kv_cache_max * (size_t)kv_dim;
+        float *hk = ctx->kv_cache_k + (size_t)layer * host_stride + (size_t)start_pos * (size_t)kv_dim;
+        float *hv = ctx->kv_cache_v + (size_t)layer * host_stride + (size_t)start_pos * (size_t)kv_dim;
+        size_t hv_bytes = (size_t)seq_len * (size_t)kv_dim * sizeof(float);
+        r = cuMemcpyDtoHAsync(hk, g_dec_k, hv_bytes, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("DtoH(dec_prefill_k)", r); return 0; }
+        r = cuMemcpyDtoHAsync(hv, g_dec_v, hv_bytes, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("DtoH(dec_prefill_v)", r); return 0; }
+
+        /* Causal attention over the full cached sequence (here: start_pos=0) */
+        int total_seq = start_pos + seq_len;
+        if (!vox_cuda_causal_attention_dev(g_dec_attn, g_dec_q, g_dec_k, g_dec_v,
+                                           seq_len, total_seq, n_heads, n_kv_heads,
+                                           head_dim, attn_scale, VOX_DEC_WINDOW, start_pos)) {
+            return 0;
+        }
+
+        /* Output projection + residual */
+        size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
+        CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+        if (!dWo) return 0;
+
+        if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, seq_len * q_dim)) return 0;
+        if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo, seq_len, q_dim, dim)) return 0;
+        if (!launch_add_inplace(g_dec_x, g_dec_proj, seq_len * dim)) return 0;
+
+        /* ---- FFN ---- */
+        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
+
+        if (ctx->ada_scale) {
+            const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
+            CUdeviceptr d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
+            if (!d_ada) return 0;
+            /* Apply per-row: x_norm[row] *= (1 + ada). */
+            for (int s = 0; s < seq_len; s++) {
+                CUdeviceptr row = g_dec_x_norm + (size_t)s * (size_t)dim * sizeof(float);
+                if (!launch_mul_1p_inplace(row, d_ada, dim)) return 0;
+            }
+        }
+
+        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
+
+        size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
+        CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+        CUdeviceptr dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+        if (!dW1 || !dW3) return 0;
+
+        if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1, seq_len, dim, hidden)) return 0;
+        if (!launch_silu_inplace(g_dec_gate, seq_len * hidden)) return 0;
+        if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3, seq_len, dim, hidden)) return 0;
+        if (!launch_mul_inplace(g_dec_gate, g_dec_up, seq_len * hidden)) return 0;
+
+        size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+        CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+        if (!dW2) return 0;
+
+        if (!launch_f32_to_bf16(g_dec_gate_bf16, g_dec_gate, seq_len * hidden)) return 0;
+        if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2, seq_len, hidden, dim)) return 0;
+        if (!launch_add_inplace(g_dec_x, g_dec_ffn, seq_len * dim)) return 0;
+    }
+
+    r = cuStreamSynchronize(g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("sync(dec_prefill)", r); return 0; }
+
+    ctx->kv_cache_len = start_pos + seq_len;
+    return 1;
+}
+
 #else
 
 int vox_cuda_available(void) { return 0; }
@@ -2503,6 +2727,13 @@ int vox_cuda_decoder_forward_full(int *out_token,
                                   vox_ctx_t *ctx,
                                   const float *input_embeds) {
     (void)out_token; (void)logits_or_null; (void)ctx; (void)input_embeds;
+    return 0;
+}
+int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
+                                  const float *input_embeds,
+                                  int seq_len,
+                                  const float *rope_freqs) {
+    (void)ctx; (void)input_embeds; (void)seq_len; (void)rope_freqs;
     return 0;
 }
 void vox_cuda_shutdown(void) {}

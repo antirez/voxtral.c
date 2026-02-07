@@ -254,7 +254,38 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         if (kv_cache_grow(ctx, ctx->kv_cache_len + seq_len + 1024) != 0) return;
     }
 
-    /* Working buffers */
+    /* RoPE frequencies (logical positions include offset from compactions) */
+    int start_pos = ctx->kv_cache_len;
+    int logical_start = ctx->kv_pos_offset + start_pos;
+    int *positions = (int *)malloc(seq_len * sizeof(int));
+    if (!positions) return;
+    for (int i = 0; i < seq_len; i++) positions[i] = logical_start + i;
+    float *rope_freqs = (float *)malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
+    if (!rope_freqs) { free(positions); return; }
+    vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
+
+    /* GPU monolithic prefill: all 26 layers in one command buffer */
+#ifdef USE_METAL
+    if (vox_metal_available()) {
+        float *x = (float *)malloc(seq_len * dim * sizeof(float));
+        if (!x) { free(positions); free(rope_freqs); return; }
+        memcpy(x, input_embeds, seq_len * dim * sizeof(float));
+        vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
+        free(x);
+        free(positions); free(rope_freqs);
+        return;
+    }
+#endif
+
+#ifdef USE_CUDA
+    if (vox_cuda_decoder_prefill_full(ctx, input_embeds, seq_len, rope_freqs)) {
+        free(positions);
+        free(rope_freqs);
+        return;
+    }
+#endif
+
+    /* Working buffers (CPU fallback) */
     float *x = (float *)malloc(seq_len * dim * sizeof(float));
     memcpy(x, input_embeds, seq_len * dim * sizeof(float));
 
@@ -265,25 +296,6 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
     float *proj_out = (float *)malloc(seq_len * dim * sizeof(float));
     float *ffn_out = (float *)malloc(seq_len * dim * sizeof(float));
-
-    /* RoPE frequencies (logical positions include offset from compactions) */
-    int start_pos = ctx->kv_cache_len;
-    int logical_start = ctx->kv_pos_offset + start_pos;
-    int *positions = (int *)malloc(seq_len * sizeof(int));
-    for (int i = 0; i < seq_len; i++) positions[i] = logical_start + i;
-    float *rope_freqs = (float *)malloc(seq_len * (head_dim / 2) * 2 * sizeof(float));
-    vox_compute_rope_freqs(rope_freqs, positions, seq_len, head_dim, VOX_ROPE_THETA);
-
-    /* GPU monolithic prefill: all 26 layers in one command buffer */
-#ifdef USE_METAL
-    if (vox_metal_available()) {
-        vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
-        free(x); free(x_norm); free(q); free(k); free(v);
-        free(attn_out); free(proj_out); free(ffn_out);
-        free(positions); free(rope_freqs);
-        return;
-    }
-#endif
 
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];

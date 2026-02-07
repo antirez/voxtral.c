@@ -4,6 +4,7 @@ This PR adds a production-oriented CUDA backend for Voxtral that works reliably 
 
 - Encoder + adapter (GPU resident, BF16 weights + cuBLAS GEMMs + CUDA elementwise kernels)
 - Decoder single-token generation (GPU resident, device KV cache + cuBLAS GEMMs + CUDA attention + GPU argmax)
+- Decoder prefill (prompt prefill, seq_len > 1): runs fully on GPU when possible
 
 The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for custom kernels to avoid PTX JIT issues under WSL2.
 
@@ -26,6 +27,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - Device-side KV cache (FP16 by default) and device-only intermediates.
   - Faster per-token attention kernel (online softmax, warp-synchronous).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
+  - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
 
 ## Build
 
@@ -66,6 +68,7 @@ All runs below are from the CLI. Stage timings are printed with `VOX_PRINT_TIMIN
 - `Decoder:` is the cumulative decoder time.
 - `Wall transcribe:` is total transcription wall time (excluding `Model load:`).
 - `Total (load+transcribe):` is a derived sum printed by `scripts/benchmark_backends.sh` for comparisons that include model load in the end-to-end time.
+- `prefill` (in the `Decoder:` line) includes prompt prefill plus the first generated token step (the timing block wraps both).
 
 Audio durations:
 - `samples/test_speech.wav`: `3.641750s` (ffprobe)
@@ -82,10 +85,10 @@ BLAS (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 
 CUDA (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 - Model load: `31 ms`
-- Wall transcribe: `3018 ms`
-- Total (load+transcribe): `3049 ms`
-- Encoder: `760 mel -> 95 tokens (646 ms)`
-- Decoder: `17 text tokens (57 steps) in 2159 ms (prefill 1435 ms + 12.9 ms/step)`
+- Wall transcribe: `3045 ms`
+- Total (load+transcribe): `3076 ms`
+- Encoder: `760 mel -> 95 tokens (683 ms)`
+- Decoder: `17 text tokens (57 steps) in 2146 ms (prefill 1396 ms + 13.4 ms/step)`
 
 ### `samples/I_have_a_dream.ogg` (180s)
 
@@ -130,3 +133,5 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_DISABLE_CUBLASLT=1`
 - Disable FP16 KV cache (use FP32 KV cache):
   - `VOX_CUDA_KV_FP16=0`
+- Disable CUDA decoder prefill fast path (force CPU prefill):
+  - `VOX_DISABLE_CUDA_PREFILL=1`
