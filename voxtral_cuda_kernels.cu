@@ -730,6 +730,40 @@ extern "C" __global__ void vox_rms_norm_f32(float *out,
     }
 }
 
+extern "C" __global__ void vox_rms_norm_to_bf16(uint16_t *out_bf16,
+                                                const float *x,
+                                                const float *weight,
+                                                int rows,
+                                                int hidden,
+                                                float eps) {
+    int r = (int)blockIdx.x;
+    if (r >= rows) return;
+
+    const float *x_row = x + (size_t)r * (size_t)hidden;
+    uint16_t *o_row = out_bf16 + (size_t)r * (size_t)hidden;
+
+    __shared__ float sh[256];
+    float sum = 0.0f;
+    for (int i = (int)threadIdx.x; i < hidden; i += (int)blockDim.x) {
+        float v = x_row[i];
+        sum += v * v;
+    }
+    sh[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) sh[threadIdx.x] += sh[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    float inv_rms = rsqrtf(sh[0] / (float)hidden + eps);
+    for (int i = (int)threadIdx.x; i < hidden; i += (int)blockDim.x) {
+        float v = x_row[i] * inv_rms * weight[i];
+        __nv_bfloat16 h = __float2bfloat16_rn(v);
+        (( __nv_bfloat16 *)o_row)[i] = h;
+    }
+}
+
 extern "C" __global__ void vox_add_bias_f32(float *x,
                                             const float *bias,
                                             int rows,
@@ -763,6 +797,17 @@ extern "C" __global__ void vox_mul_1p_inplace_f32(float *x,
     int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (idx >= n) return;
     x[idx] *= (1.0f + scale[idx]);
+}
+
+extern "C" __global__ void vox_mul_1p_rows_inplace_f32(float *x,
+                                                       const float *scale,
+                                                       int rows,
+                                                       int cols) {
+    int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int total = rows * cols;
+    if (idx >= total) return;
+    int c = idx % cols;
+    x[idx] *= (1.0f + scale[c]);
 }
 
 extern "C" __global__ void vox_silu_inplace_f32(float *x, int n) {

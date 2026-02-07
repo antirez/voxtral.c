@@ -26,6 +26,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
 - Decoder full path:
   - Device-side KV cache (FP16 by default) and device-only intermediates.
   - Faster per-token attention kernel (online softmax, warp-synchronous).
+  - Optional CUDA Graph capture for the single-token decoder step (reduces CPU launch overhead; opt-in).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
   - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
 
@@ -90,6 +91,19 @@ CUDA (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 - Encoder: `760 mel -> 95 tokens (683 ms)`
 - Decoder: `17 text tokens (57 steps) in 2146 ms (prefill 1396 ms + 13.4 ms/step)`
 
+### CUDA Graphs (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_GRAPHS=1
+```
+
+On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; ~60s), CUDA Graphs reduced decoder launch overhead and improved throughput:
+
+- Without graphs: `Wall transcribe 17640 ms`, decoder `19.4 ms/step`
+- With graphs: `Wall transcribe 16785 ms`, decoder `18.2 ms/step`
+
 ### `samples/I_have_a_dream.ogg` (180s)
 
 Convert once:
@@ -123,6 +137,10 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
 
 ## Debug / Escape Hatches
 
+- Enable CUDA Graphs for the decoder single-token step (opt-in):
+  - `VOX_CUDA_GRAPHS=1`
+- Disable CUDA Graphs (force non-graph path):
+  - `VOX_DISABLE_CUDA_GRAPHS=1`
 - Disable full CUDA encoder+adapter:
   - `VOX_DISABLE_CUDA_ENCODER_FULL=1`
 - Disable full CUDA decoder path:
@@ -135,3 +153,5 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_CUDA_KV_FP16=0`
 - Disable CUDA decoder prefill fast path (force CPU prefill):
   - `VOX_DISABLE_CUDA_PREFILL=1`
+- Disable RMSNorm->BF16 fused kernel (debug fallback):
+  - `VOX_DISABLE_CUDA_RMSNORM_BF16_FUSED=1`

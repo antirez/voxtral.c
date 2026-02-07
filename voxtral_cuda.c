@@ -37,10 +37,12 @@ static CUfunction g_fn_unpack_heads = 0;
 static CUfunction g_fn_expand_kv_heads = 0;
 static CUfunction g_fn_softmax = 0;
 static CUfunction g_fn_rms_norm = 0;
+static CUfunction g_fn_rms_norm_to_bf16 = 0;
 static CUfunction g_fn_add_bias = 0;
 static CUfunction g_fn_add_inplace = 0;
 static CUfunction g_fn_mul_inplace = 0;
 static CUfunction g_fn_mul_1p_inplace = 0;
+static CUfunction g_fn_mul_1p_rows_inplace = 0;
 static CUfunction g_fn_silu = 0;
 static CUfunction g_fn_gelu = 0;
 static CUfunction g_fn_f32_to_bf16 = 0;
@@ -490,6 +492,13 @@ static int cuda_load_kernel_module(void) {
         g_fn_mul_1p_inplace && g_fn_silu && g_fn_gelu &&
         g_fn_f32_to_bf16 && g_fn_f32_to_f16 &&
         g_fn_apply_rope && g_fn_downsample4 && g_fn_argmax) {
+        /* Optional fusions (best-effort). */
+        if (g_mod) {
+            if (!g_fn_rms_norm_to_bf16)
+                (void)cuModuleGetFunction(&g_fn_rms_norm_to_bf16, g_mod, "vox_rms_norm_to_bf16");
+            if (!g_fn_mul_1p_rows_inplace)
+                (void)cuModuleGetFunction(&g_fn_mul_1p_rows_inplace, g_mod, "vox_mul_1p_rows_inplace_f32");
+        }
         /* Optional kernels used for CUDA Graph capture (best-effort). */
         if (g_mod) {
             if (!g_fn_kv_append_dyn_fp16)
@@ -532,6 +541,7 @@ static int cuda_load_kernel_module(void) {
 
     r = cuModuleGetFunction(&g_fn_rms_norm, g_mod, "vox_rms_norm_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_rms_norm_f32)", r); return 0; }
+    (void)cuModuleGetFunction(&g_fn_rms_norm_to_bf16, g_mod, "vox_rms_norm_to_bf16");
     r = cuModuleGetFunction(&g_fn_add_bias, g_mod, "vox_add_bias_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_add_bias_f32)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_add_inplace, g_mod, "vox_add_inplace_f32");
@@ -540,6 +550,7 @@ static int cuda_load_kernel_module(void) {
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_mul_inplace_f32)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_mul_1p_inplace, g_mod, "vox_mul_1p_inplace_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_mul_1p_inplace_f32)", r); return 0; }
+    (void)cuModuleGetFunction(&g_fn_mul_1p_rows_inplace, g_mod, "vox_mul_1p_rows_inplace_f32");
     r = cuModuleGetFunction(&g_fn_silu, g_mod, "vox_silu_inplace_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_silu_inplace_f32)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_gelu, g_mod, "vox_gelu_inplace_f32");
@@ -658,6 +669,30 @@ static int launch_rms_norm(CUdeviceptr out,
     return 1;
 }
 
+static int launch_rms_norm_to_bf16(CUdeviceptr out_bf16,
+                                   CUdeviceptr x,
+                                   CUdeviceptr weight,
+                                   int rows,
+                                   int hidden,
+                                   float eps) {
+    if (!out_bf16 || !x || !weight) return 0;
+    if (rows <= 0 || hidden <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    const char *disable = getenv("VOX_DISABLE_CUDA_RMSNORM_BF16_FUSED");
+    if (disable && disable[0] && disable[0] != '0') return 0;
+    if (!g_fn_rms_norm_to_bf16) return 0;
+
+    int threads = 256;
+    void *params[] = { &out_bf16, &x, &weight, &rows, &hidden, &eps };
+    CUresult r = cuLaunchKernel(g_fn_rms_norm_to_bf16,
+                                rows, 1, 1,
+                                threads, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(rms_norm_to_bf16)", r); return 0; }
+    return 1;
+}
+
 static int launch_add_bias(CUdeviceptr x,
                            CUdeviceptr bias,
                            int rows,
@@ -733,6 +768,28 @@ static int launch_mul_1p_inplace(CUdeviceptr x,
                                 0, g_stream,
                                 params, NULL);
     if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(mul_1p)", r); return 0; }
+    return 1;
+}
+
+static int launch_mul_1p_rows_inplace(CUdeviceptr x,
+                                      CUdeviceptr scale,
+                                      int rows,
+                                      int cols) {
+    if (!x || !scale) return 0;
+    if (rows <= 0 || cols <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    if (!g_fn_mul_1p_rows_inplace) return 0;
+
+    int threads = 256;
+    int total = rows * cols;
+    int blocks = (total + threads - 1) / threads;
+    void *params[] = { &x, &scale, &rows, &cols };
+    CUresult r = cuLaunchKernel(g_fn_mul_1p_rows_inplace,
+                                blocks, 1, 1,
+                                threads, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(mul_1p_rows)", r); return 0; }
     return 1;
 }
 
@@ -1427,10 +1484,12 @@ void vox_cuda_shutdown(void) {
     g_fn_expand_kv_heads = 0;
     g_fn_softmax = 0;
     g_fn_rms_norm = 0;
+    g_fn_rms_norm_to_bf16 = 0;
     g_fn_add_bias = 0;
     g_fn_add_inplace = 0;
     g_fn_mul_inplace = 0;
     g_fn_mul_1p_inplace = 0;
+    g_fn_mul_1p_rows_inplace = 0;
     g_fn_silu = 0;
     g_fn_gelu = 0;
     g_fn_f32_to_bf16 = 0;
@@ -2247,11 +2306,11 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
         CUdeviceptr d_w2_bias = f32_cache_get(l->w2_bias, (size_t)dim * sizeof(float));
         if (!d_attn_norm || !d_ffn_norm || !d_wq_bias || !d_wv_bias || !d_wo_bias || !d_w2_bias) return 0;
 
-        /* x_norm = rms_norm(x) */
-        if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
-
-        /* x_norm_bf16 */
-        if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+        /* x_norm_bf16 = rms_norm(x) */
+        if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
+            if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
+            if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+        }
 
         /* Q,K,V projections */
         size_t bytes_wq = (size_t)qkv_dim * (size_t)dim * sizeof(uint16_t);
@@ -2289,8 +2348,10 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
         if (!launch_add_inplace(g_enc_x, g_enc_proj, seq_len * dim)) return 0;
 
         /* FFN */
-        if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
-        if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+        if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
+            if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
+            if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+        }
 
         size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
         CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
@@ -2588,8 +2649,10 @@ static int decoder_graph_capture(vox_ctx_t *ctx) {
         CUdeviceptr v_base = g_v_cache + (size_t)layer * layer_stride;
 
         /* Attention norm */
-        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
-        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
+        if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) {
+            if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
+            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
+        }
 
         /* Q,K,V projections */
         if (!gemm_t_bf16_bf16_f32(g_dec_q, g_dec_x_bf16, dWq[layer], 1, dim, q_dim)) goto capture_fail;
@@ -2812,8 +2875,10 @@ int vox_cuda_decoder_forward_full(int *out_token,
         if (!d_attn_norm || !d_ffn_norm) return 0;
 
         /* Attention norm */
-        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
-        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
+        if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm, 1, dim, VOX_DEC_NORM_EPS)) {
+            if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
+            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
+        }
 
         /* Q,K,V projections */
         size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
@@ -2993,8 +3058,10 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
         if (!d_attn_norm || !d_ffn_norm) return 0;
 
         /* ---- Self-attention ---- */
-        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
-        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
+        if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) {
+            if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
+            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
+        }
 
         /* Q, K, V projections (no bias in decoder, bf16 weights) */
         size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
@@ -3052,10 +3119,12 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
             const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
             CUdeviceptr d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
             if (!d_ada) return 0;
-            /* Apply per-row: x_norm[row] *= (1 + ada). */
-            for (int s = 0; s < seq_len; s++) {
-                CUdeviceptr row = g_dec_x_norm + (size_t)s * (size_t)dim * sizeof(float);
-                if (!launch_mul_1p_inplace(row, d_ada, dim)) return 0;
+            if (!launch_mul_1p_rows_inplace(g_dec_x_norm, d_ada, seq_len, dim)) {
+                /* Fallback: per-row kernel launch. */
+                for (int s = 0; s < seq_len; s++) {
+                    CUdeviceptr row = g_dec_x_norm + (size_t)s * (size_t)dim * sizeof(float);
+                    if (!launch_mul_1p_inplace(row, d_ada, dim)) return 0;
+                }
             }
         }
 
