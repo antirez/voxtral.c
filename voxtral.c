@@ -10,6 +10,9 @@
 #include "voxtral_safetensors.h"
 #include "voxtral_audio.h"
 #include "voxtral_tokenizer.h"
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
@@ -327,6 +330,7 @@ void vox_free(vox_ctx_t *ctx) {
     free(ctx->dec_up);
     free(ctx->dec_ffn_out);
     free(ctx->dec_rope_freqs);
+    free(ctx->dec_logits);
 
     if (ctx->safetensors) {
         safetensors_close((safetensors_file_t *)ctx->safetensors);
@@ -352,6 +356,12 @@ void vox_free(vox_ctx_t *ctx) {
 
 #define RAW_AUDIO_LENGTH_PER_TOK 1280
 #define OFFLINE_STREAMING_BUFFER_TOKENS 10
+
+/* Chunked encoder overlap (mel frames). Used by the CUDA full-encoder path which
+ * re-encodes overlap to provide sliding-window context. Must be >= 2*VOX_ENC_WINDOW. */
+#define OVERLAP_MEL (VOX_ENC_WINDOW * 2 + 4)
+/* New mel frames per chunk for the CUDA full-encoder path (throughput vs latency). */
+#define STREAM_CHUNK_NEW_MEL 2000
 
 /* First chunk minimum mel frames (enough for 39 prompt adapter tokens) */
 #define STREAM_FIRST_CHUNK_MIN_MEL  312
@@ -392,8 +402,15 @@ struct vox_stream {
     vox_mel_ctx_t *mel_ctx;
     int real_samples_fed;
 
-    /* Encoder chunk tracking */
+    /* Encoder progress in mel frames */
     int mel_cursor;
+
+    /* Chunked encoder state (used by CUDA full encoder path). */
+    int chunk_num;
+    int overlap_mel;
+    int chunk_new_mel;
+    int first_chunk_min_mel;
+    int chunk_user_override;
 
     /* Incremental conv stem state */
     float *mel_tail;           /* [128 * 2] last 2 mel frames (column-major: [128, 2]) */
@@ -664,13 +681,128 @@ static float *stream_conv_stem(vox_stream_t *s, const float *mel_new,
     return result;
 }
 
-/* Run encoder incrementally on available mel, append adapter tokens */
+/* Return non-zero if we should use the CUDA full encoder+adapter path.
+ * This path is chunked (re-encodes overlap) and prioritizes throughput. */
+static int stream_use_cuda_encoder_full(void) {
+#ifdef USE_CUDA
+    static int cached = -1;
+    if (cached != -1) return cached;
+
+    const char *disable = getenv("VOX_DISABLE_CUDA_ENCODER_FULL");
+    if (disable && disable[0] && disable[0] != '0') {
+        cached = 0;
+        return cached;
+    }
+    cached = vox_cuda_available();
+    return cached;
+#else
+    return 0;
+#endif
+}
+
+/* Run encoder on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
     int total_mel = 0;
     float *mel_data = vox_mel_data(s->mel_ctx, &total_mel);
     int dim = VOX_DEC_DIM;
 
     int new_mel = total_mel - s->mel_cursor;
+
+    /* CUDA full encoder+adapter path: chunked re-encode with overlap. */
+    if (stream_use_cuda_encoder_full()) {
+        int need_mel = (s->chunk_num == 0) ? s->first_chunk_min_mel : s->chunk_new_mel;
+
+        while (new_mel >= need_mel || (s->finished && new_mel > 0)) {
+            int overlap = (s->chunk_num == 0) ? 0 : s->overlap_mel;
+            int slice_start = s->mel_cursor - overlap;
+            int actual_overlap_mel;
+            if (slice_start < 0) {
+                /* Overlap reaches back to beginning — discard previous partial
+                 * results and re-encode from scratch as a single pass. */
+                slice_start = 0;
+                actual_overlap_mel = 0;
+                s->total_adapter = 0;
+            } else {
+                actual_overlap_mel = s->mel_cursor - slice_start;
+            }
+
+            int slice_end = s->mel_cursor + new_mel;
+            if (!s->finished && new_mel > s->chunk_new_mel)
+                slice_end = s->mel_cursor + s->chunk_new_mel;
+            if (slice_end > total_mel) slice_end = total_mel;
+
+            int slice_len = slice_end - slice_start;
+            if (slice_len <= 0) break;
+
+            struct timeval t0, t1;
+            gettimeofday(&t0, NULL);
+
+            float *adapter_chunk = NULL;
+            int chunk_tokens = 0;
+
+            int used_cuda = 0;
+#ifdef USE_CUDA
+            used_cuda = vox_cuda_encode_adapter(&adapter_chunk, &chunk_tokens,
+                                                s->ctx,
+                                                mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                                                slice_len,
+                                                actual_overlap_mel);
+#endif
+
+            if (!used_cuda) {
+                /* Fallback: CPU encoder + adapter (matmuls may still be CUDA). */
+                int enc_len = 0;
+                float *enc_out = vox_encoder_forward(s->ctx,
+                    mel_data + (size_t)slice_start * VOX_MEL_BINS,
+                    slice_len, &enc_len);
+                if (!enc_out) break;
+
+                int overlap_enc = actual_overlap_mel / 2;
+                int new_enc_len = enc_len - overlap_enc;
+                new_enc_len = (new_enc_len / VOX_DOWNSAMPLE) * VOX_DOWNSAMPLE;
+
+                if (new_enc_len > 0) {
+                    adapter_chunk = vox_adapter_forward(s->ctx,
+                        enc_out + (size_t)overlap_enc * VOX_ENC_DIM,
+                        new_enc_len, &chunk_tokens);
+                } else {
+                    chunk_tokens = 0;
+                }
+
+                free(enc_out);
+                if (new_enc_len > 0 && !adapter_chunk) break;
+            }
+
+            gettimeofday(&t1, NULL);
+            s->encoder_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                             (t1.tv_usec - t0.tv_usec) / 1000.0;
+
+            if (chunk_tokens > 0 && adapter_chunk) {
+                if (s->total_adapter + chunk_tokens > s->adapter_cap) {
+                    int new_cap = s->adapter_cap ? s->adapter_cap * 2 : 256;
+                    while (new_cap < s->total_adapter + chunk_tokens) new_cap *= 2;
+                    float *tmp = (float *)realloc(s->adapter_buf,
+                        (size_t)new_cap * dim * sizeof(float));
+                    if (!tmp) { free(adapter_chunk); return; }
+                    s->adapter_buf = tmp;
+                    s->adapter_cap = new_cap;
+                }
+                memcpy(s->adapter_buf + (size_t)s->total_adapter * dim,
+                       adapter_chunk, (size_t)chunk_tokens * dim * sizeof(float));
+                s->total_adapter += chunk_tokens;
+            }
+            free(adapter_chunk);
+
+            s->mel_cursor = slice_end;
+            s->chunk_num++;
+
+            new_mel = total_mel - s->mel_cursor;
+            need_mel = s->chunk_new_mel;
+        }
+        return;
+    }
+
+    /* Default: incremental conv stem + incremental transformer KV cache. */
     int need_mel = (!s->conv_stem_initialized) ? STREAM_FIRST_CHUNK_MIN_MEL : s->min_new_mel;
 
     if (new_mel < need_mel && !s->finished) return;
@@ -838,6 +970,8 @@ static void stream_run_decoder(vox_stream_t *s) {
     int dim = VOX_DEC_DIM;
     int prompt_len = 1 + 32 + s->ctx->delay_tokens;
     uint16_t *tok_emb_bf16 = s->ctx->decoder.tok_embeddings_bf16;
+    const int eos_is_terminal = s->finished; /* EOS is only final once input is finished (offline right-pad added). */
+    float *logits_out = (s->n_alt > 1) ? s->logits : NULL;
 
     /* Prefill when we have enough adapter tokens */
     if (!s->decoder_started && s->total_adapter >= prompt_len) {
@@ -856,7 +990,10 @@ static void stream_run_decoder(vox_stream_t *s) {
 
         s->ctx->kv_cache_len = 0;
         s->ctx->kv_pos_offset = 0;
-        /* Keep KV cache allocated — vox_decoder_prefill will reuse or grow it */
+#ifdef USE_CUDA
+        vox_cuda_kv_cache_reset();
+#endif
+        /* Keep KV cache allocated — vox_decoder_prefill will reuse or grow it. */
 
         int prefill_count = prompt_len - 1;
         vox_decoder_prefill(s->ctx, prompt_embeds, prefill_count);
@@ -865,7 +1002,9 @@ static void stream_run_decoder(vox_stream_t *s) {
                (size_t)dim * sizeof(float));
         free(prompt_embeds);
 
-        s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, s->logits);
+        /* If alternatives are disabled, pass logits=NULL to avoid copying
+         * full-vocab logits back to host on CUDA. */
+        s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
         s->n_generated++;
 
         /* Enqueue if it's a text token */
@@ -874,7 +1013,15 @@ static void stream_run_decoder(vox_stream_t *s) {
             stream_fill_alts(s, s->prev_token, alts);
             if (alts[0]) { stream_enqueue_token(s, alts); s->n_text_tokens++; }
         }
-        if (s->prev_token == TOKEN_EOS) s->eos_seen = 1;
+        if (s->prev_token == TOKEN_EOS) {
+            if (eos_is_terminal) {
+                s->eos_seen = 1;
+            } else {
+                /* In incremental/online mode we may see EOS at chunk boundaries.
+                 * Keep going by treating it as padding rather than final stop. */
+                s->prev_token = TOKEN_STREAMING_PAD;
+            }
+        }
 
         s->gen_pos = prompt_len;
         s->decoder_started = 1;
@@ -900,7 +1047,7 @@ static void stream_run_decoder(vox_stream_t *s) {
             for (int j = 0; j < dim; j++)
                 s->step_embed[j] = a[j] + s->tok_tmp[j];
 
-            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, s->logits);
+            s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
             s->n_generated++;
 
             if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
@@ -910,7 +1057,14 @@ static void stream_run_decoder(vox_stream_t *s) {
             }
 
             s->gen_pos++;
-            if (s->prev_token == TOKEN_EOS) { s->eos_seen = 1; break; }
+            if (s->prev_token == TOKEN_EOS) {
+                if (eos_is_terminal) {
+                    s->eos_seen = 1;
+                    break;
+                }
+                /* Provisional EOS: continue decoding using padding token. */
+                s->prev_token = TOKEN_STREAMING_PAD;
+            }
         }
         if (s->n_generated > gen_before) {
             gettimeofday(&t1, NULL);
@@ -962,6 +1116,24 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
 
     /* Default processing interval: 2 seconds (200 mel frames) */
     s->min_new_mel = (int)(STREAM_DEFAULT_INTERVAL * 100.0f);
+
+    /* Chunked encoder defaults (used by CUDA full encoder path). */
+    s->overlap_mel = OVERLAP_MEL;
+    s->chunk_new_mel = STREAM_CHUNK_NEW_MEL;
+    s->first_chunk_min_mel = STREAM_FIRST_CHUNK_MIN_MEL;
+
+    /* Optional offline tuning: increase chunk size to reduce overlap re-encode overhead.
+     * This trades latency for throughput (useful for long files). */
+    {
+        const char *v = getenv("VOX_STREAM_CHUNK_NEW_MEL");
+        if (v && v[0]) {
+            int n = atoi(v);
+            if (n >= 256 && n <= 32768) {
+                s->chunk_new_mel = n;
+                s->chunk_user_override = 1;
+            }
+        }
+    }
 
     return s;
 }
@@ -1052,7 +1224,9 @@ void vox_stream_free(vox_stream_t *s) {
     if (!s) return;
 
     /* Print stats after caller has drained all tokens */
-    if (vox_verbose >= 1) {
+    const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
+    int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
+    if (vox_verbose >= 1 || force_timing) {
         fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
                 s->mel_cursor, s->total_adapter, s->encoder_ms);
         if (s->n_text_tokens > 0) {
@@ -1264,6 +1438,18 @@ char *vox_transcribe_stdin(vox_ctx_t *ctx) {
 
     vox_stream_t *s = vox_stream_init(ctx);
     if (!s) return NULL;
+
+    /* Optional batching for stdin raw mode to reduce overhead when the input
+     * arrives in many small chunks (e.g. ffmpeg pipe). Default is 0 (process on
+     * every feed). */
+    {
+        const char *v = getenv("VOX_STDIN_INTERVAL_SEC");
+        if (v && v[0]) {
+            float sec = (float)atof(v);
+            if (sec < 0.0f) sec = 0.0f;
+            vox_set_processing_interval(s, sec);
+        }
+    }
 
     /* Feed the 4 peeked header bytes as 2 s16le samples */
     {

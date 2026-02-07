@@ -198,6 +198,7 @@ typedef struct {
     float *dec_attn_out, *dec_proj_out;
     float *dec_gate, *dec_up, *dec_ffn_out;
     float *dec_rope_freqs;
+    float *dec_logits; /* Optional: only used if caller passes logits=NULL */
 } vox_ctx_t;
 
 /* ========================================================================

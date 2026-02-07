@@ -16,6 +16,9 @@
 #include "voxtral.h"
 #include "voxtral_kernels.h"
 #include "voxtral_safetensors.h"
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
@@ -222,6 +225,10 @@ static void kv_cache_compact(vox_ctx_t *ctx) {
         memmove(v_base, v_src, keep_bytes);
     }
 
+#ifdef USE_CUDA
+    vox_cuda_kv_cache_compact(discard, keep, kv_dim, ctx->kv_cache_max);
+#endif
+
     ctx->kv_pos_offset += discard;
     ctx->kv_cache_len = keep;
 }
@@ -311,6 +318,10 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
             memcpy(kv_cache_v_at(ctx, layer, start_pos + s),
                    v + s * kv_dim, kv_dim * sizeof(float));
         }
+#ifdef USE_CUDA
+        /* Keep device-side KV cache in sync for the upcoming single-token decode loop. */
+        vox_cuda_kv_cache_append_block(layer, start_pos, seq_len, kv_dim, VOX_DEC_WINDOW, k, v);
+#endif
 
         /* Causal attention over full cached sequence */
         int total_seq = start_pos + seq_len;
@@ -378,24 +389,31 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
 /* Lazy-init persistent single-token decoder buffers */
 static void ensure_dec_buffers(vox_ctx_t *ctx) {
-    if (ctx->dec_x) return; /* already allocated */
     int dim = VOX_DEC_DIM;
     int q_dim = VOX_DEC_HEADS * VOX_DEC_HEAD_DIM;
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
     int hidden = VOX_DEC_HIDDEN;
     int head_dim = VOX_DEC_HEAD_DIM;
 
-    ctx->dec_x        = (float *)malloc(dim * sizeof(float));
-    ctx->dec_x_norm   = (float *)malloc(dim * sizeof(float));
-    ctx->dec_q        = (float *)malloc(q_dim * sizeof(float));
-    ctx->dec_k        = (float *)malloc(kv_dim * sizeof(float));
-    ctx->dec_v        = (float *)malloc(kv_dim * sizeof(float));
-    ctx->dec_attn_out = (float *)malloc(q_dim * sizeof(float));
-    ctx->dec_proj_out = (float *)malloc(dim * sizeof(float));
-    ctx->dec_gate     = (float *)malloc(hidden * sizeof(float));
-    ctx->dec_up       = (float *)malloc(hidden * sizeof(float));
-    ctx->dec_ffn_out  = (float *)malloc(dim * sizeof(float));
-    ctx->dec_rope_freqs = (float *)malloc((head_dim / 2) * 2 * sizeof(float));
+    if (!ctx->dec_x) {
+        ctx->dec_x        = (float *)malloc(dim * sizeof(float));
+        ctx->dec_x_norm   = (float *)malloc(dim * sizeof(float));
+        ctx->dec_q        = (float *)malloc(q_dim * sizeof(float));
+        ctx->dec_k        = (float *)malloc(kv_dim * sizeof(float));
+        ctx->dec_v        = (float *)malloc(kv_dim * sizeof(float));
+        ctx->dec_attn_out = (float *)malloc(q_dim * sizeof(float));
+        ctx->dec_proj_out = (float *)malloc(dim * sizeof(float));
+        ctx->dec_gate     = (float *)malloc(hidden * sizeof(float));
+        ctx->dec_up       = (float *)malloc(hidden * sizeof(float));
+        ctx->dec_ffn_out  = (float *)malloc(dim * sizeof(float));
+        ctx->dec_rope_freqs = (float *)malloc((head_dim / 2) * 2 * sizeof(float));
+    }
+
+    /* If the caller passes logits=NULL, we still need scratch space for the CPU
+     * fallback path. The CUDA path will avoid copying logits back when NULL. */
+    if (!ctx->dec_logits) {
+        ctx->dec_logits = (float *)malloc((size_t)VOX_VOCAB_SIZE * sizeof(float));
+    }
 }
 
 int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits) {
@@ -407,22 +425,6 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     int hidden = VOX_DEC_HIDDEN;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
-
-    /* Persistent working buffers (allocated once, reused across tokens) */
-    ensure_dec_buffers(ctx);
-    float *x = ctx->dec_x;
-    float *x_norm = ctx->dec_x_norm;
-    float *q = ctx->dec_q;
-    float *k = ctx->dec_k;
-    float *v = ctx->dec_v;
-    float *attn_out = ctx->dec_attn_out;
-    float *proj_out = ctx->dec_proj_out;
-    float *gate_buf = ctx->dec_gate;
-    float *up_buf = ctx->dec_up;
-    float *ffn_out = ctx->dec_ffn_out;
-    float *rope_freqs = ctx->dec_rope_freqs;
-
-    memcpy(x, input_embeds, dim * sizeof(float));
 
     int pos = ctx->kv_cache_len;
 
@@ -436,6 +438,33 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
             if (kv_cache_grow(ctx, pos + 1024) != 0) return 2; /* EOS on OOM */
         }
     }
+
+#ifdef USE_CUDA
+    {
+        int tok = 2;
+        if (vox_cuda_decoder_forward_full(&tok, logits, ctx, input_embeds)) {
+            return tok;
+        }
+    }
+#endif
+
+    /* Persistent working buffers (allocated once, reused across tokens) */
+    ensure_dec_buffers(ctx);
+    float *logits_buf = logits ? logits : ctx->dec_logits;
+    if (!logits_buf) return 2; /* EOS on OOM */
+    float *x = ctx->dec_x;
+    float *x_norm = ctx->dec_x_norm;
+    float *q = ctx->dec_q;
+    float *k = ctx->dec_k;
+    float *v = ctx->dec_v;
+    float *attn_out = ctx->dec_attn_out;
+    float *proj_out = ctx->dec_proj_out;
+    float *gate_buf = ctx->dec_gate;
+    float *up_buf = ctx->dec_up;
+    float *ffn_out = ctx->dec_ffn_out;
+    float *rope_freqs = ctx->dec_rope_freqs;
+
+    memcpy(x, input_embeds, dim * sizeof(float));
 
     /* RoPE uses logical position (physical + offset from compactions) */
     int logical_pos = ctx->kv_pos_offset + pos;
@@ -478,9 +507,14 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         float *full_k = kv_cache_k_at(ctx, layer, 0);
         float *full_v = kv_cache_v_at(ctx, layer, 0);
 
-        vox_causal_attention(attn_out, q, full_k, full_v,
-                             1, total_seq, n_heads, n_kv_heads,
-                             head_dim, scale, VOX_DEC_WINDOW, pos);
+#ifdef USE_CUDA
+        if (!vox_cuda_attention_step(attn_out, q, k, v, layer, pos, total_seq, VOX_DEC_WINDOW))
+#endif
+        {
+            vox_causal_attention(attn_out, q, full_k, full_v,
+                                 1, total_seq, n_heads, n_kv_heads,
+                                 head_dim, scale, VOX_DEC_WINDOW, pos);
+        }
 
         vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
         vox_add_inplace(x, proj_out, dim);
@@ -502,13 +536,13 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     ctx->kv_cache_len = pos + 1;
 
     vox_rms_norm(x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
-    vox_matmul_t_bf16(logits, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
+    vox_matmul_t_bf16(logits_buf, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);
 
     int best = 0;
-    float best_val = logits[0];
+    float best_val = logits_buf[0];
     for (int i = 1; i < VOX_VOCAB_SIZE; i++) {
-        if (logits[i] > best_val) {
-            best_val = logits[i];
+        if (logits_buf[i] > best_val) {
+            best_val = logits_buf[i];
             best = i;
         }
     }
