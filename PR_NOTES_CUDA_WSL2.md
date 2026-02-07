@@ -65,6 +65,7 @@ All runs below are from the CLI. Stage timings are printed with `VOX_PRINT_TIMIN
 - `Encoder:` is the cumulative encoder+adapter time.
 - `Decoder:` is the cumulative decoder time.
 - `Wall transcribe:` is total transcription wall time (excluding `Model load:`).
+- `Total (load+transcribe):` is a derived sum printed by `scripts/benchmark_backends.sh` for comparisons that include model load in the end-to-end time.
 
 Audio durations:
 - `samples/test_speech.wav`: `3.641750s` (ffprobe)
@@ -75,12 +76,14 @@ Audio durations:
 BLAS (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 - Model load: `75 ms`
 - Wall transcribe: `40918 ms`
+- Total (load+transcribe): `40993 ms`
 - Encoder: `760 mel -> 95 tokens (13864 ms)`
 - Decoder: `17 text tokens (57 steps) in 27046 ms (prefill 7772 ms + 344.2 ms/step)`
 
 CUDA (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 - Model load: `31 ms`
 - Wall transcribe: `3018 ms`
+- Total (load+transcribe): `3049 ms`
 - Encoder: `760 mel -> 95 tokens (646 ms)`
 - Decoder: `17 text tokens (57 steps) in 2159 ms (prefill 1435 ms + 12.9 ms/step)`
 
@@ -95,12 +98,14 @@ ffmpeg -y -hide_banner -loglevel error -i samples/I_have_a_dream.ogg -ac 1 -ar 1
 BLAS:
 - Model load: `68 ms`
 - Wall transcribe: `1468788 ms` (24:29)
+- Total (load+transcribe): `1468856 ms`
 - Encoder: `18400 mel -> 2300 tokens (541742 ms)` (9:02)
 - Decoder: `311 text tokens (2262 steps) in 926821 ms (prefill 7398 ms + 406.6 ms/step)` (15:27)
 
 CUDA:
 - Model load: `39 ms`
 - Wall transcribe: `81686 ms` (1:22)
+- Total (load+transcribe): `81725 ms`
 - Encoder: `18400 mel -> 2299 tokens (2588 ms)`
 - Decoder: `310 text tokens (2261 steps) in 78625 ms (prefill 1466 ms + 34.1 ms/step)` (1:19)
 
