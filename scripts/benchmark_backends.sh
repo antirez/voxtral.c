@@ -9,6 +9,25 @@ if [[ ! -d "$MODEL_DIR" ]]; then
   exit 1
 fi
 
+get_audio_duration_s() {
+  local wav="$1"
+  if command -v ffprobe >/dev/null 2>&1; then
+    # ffprobe is the most accurate across formats/headers.
+    ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$wav"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    # Fallback for .wav only.
+    python3 - "$wav" <<'PY'
+import sys, wave
+with wave.open(sys.argv[1], "rb") as w:
+    print(w.getnframes() / float(w.getframerate()))
+PY
+    return 0
+  fi
+  return 1
+}
+
 SAMPLE_WAV="$SAMPLE_FILE"
 tmp_wav=""
 lower="${SAMPLE_FILE,,}"
@@ -23,35 +42,64 @@ if [[ "$lower" != *.wav ]]; then
   trap 'rm -f "$tmp_wav"' EXIT
 fi
 
+audio_s="$(get_audio_duration_s "$SAMPLE_WAV" || true)"
+if [[ -n "${audio_s:-}" ]]; then
+  echo "Audio duration: ${audio_s}s"
+else
+  echo "[warn] could not determine audio duration (missing ffprobe/python3?)"
+fi
+echo
+
 run_case() {
   local backend="$1"
-  echo "== backend: $backend =="
+  local label="${2:-$backend}"
+  shift 2 || true
+  local env_kv=("$@") # zero or more VAR=VALUE pairs
+
+  local slug="${label//[^a-zA-Z0-9]/_}"
+  echo "== backend: $label =="
   make "$backend"
-  VOX_PRINT_TIMINGS=1 /usr/bin/time -f "elapsed=%E cpu=%P maxrss_kb=%M" -o /tmp/voxtral_${backend}.time \
-    ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_WAV" --silent >/tmp/voxtral_${backend}.txt 2>/tmp/voxtral_${backend}.err
-  cat /tmp/voxtral_${backend}.time
-  rg --no-line-number --no-heading '^(Model load:|Wall transcribe:|Encoder:|Decoder:)' /tmp/voxtral_${backend}.err || true
+  env VOX_PRINT_TIMINGS=1 "${env_kv[@]}" \
+    /usr/bin/time -f "elapsed=%E cpu=%P maxrss_kb=%M" -o "/tmp/voxtral_${slug}.time" \
+    ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_WAV" --silent >"/tmp/voxtral_${slug}.txt" 2>"/tmp/voxtral_${slug}.err"
+  cat "/tmp/voxtral_${slug}.time"
+  rg --no-line-number --no-heading '^(Model load:|Wall transcribe:|Encoder:|Decoder:)' "/tmp/voxtral_${slug}.err" || true
   # Some benchmark comparisons include model load in "total time". Provide an
   # apples-to-apples derived figure without requiring external math.
-  load_ms="$(awk '/^Model load:/ {print $3}' /tmp/voxtral_${backend}.err | head -n1 || true)"
-  wall_ms="$(awk '/^Wall transcribe:/ {print $3}' /tmp/voxtral_${backend}.err | head -n1 || true)"
+  load_ms="$(awk '/^Model load:/ {print $3}' "/tmp/voxtral_${slug}.err" | head -n1 || true)"
+  wall_ms="$(awk '/^Wall transcribe:/ {print $3}' "/tmp/voxtral_${slug}.err" | head -n1 || true)"
   if [[ -n "${load_ms:-}" && -n "${wall_ms:-}" ]]; then
-    echo "Total (load+transcribe): $((load_ms + wall_ms)) ms"
+    total_ms="$((load_ms + wall_ms))"
+    echo "Total (load+transcribe): ${total_ms} ms"
+    if [[ -n "${audio_s:-}" ]]; then
+      xrt_wall="$(awk -v a="$audio_s" -v w="$wall_ms" 'BEGIN{ if(w>0) printf "%.2f", (a*1000.0)/w; else printf "nan"; }')"
+      xrt_total="$(awk -v a="$audio_s" -v t="$total_ms" 'BEGIN{ if(t>0) printf "%.2f", (a*1000.0)/t; else printf "nan"; }')"
+      echo "xRT (wall): ${xrt_wall}x"
+      echo "xRT (total): ${xrt_total}x"
+    fi
   fi
-  echo "output_bytes=$(wc -c </tmp/voxtral_${backend}.txt)"
+  out_bytes="$(wc -c <"/tmp/voxtral_${slug}.txt")"
+  echo "output_bytes=${out_bytes}"
   echo
 }
 
 ran_blas=0
 if make blas >/dev/null 2>&1; then
-  run_case blas
+  run_case blas blas
   ran_blas=1
 else
   echo "[warn] BLAS backend build failed (missing OpenBLAS headers/libs?). Skipping BLAS benchmark."
   echo "[hint] On Ubuntu: sudo apt-get install libopenblas-dev"
   echo
 fi
-run_case cuda
+run_case cuda cuda
+
+if [[ "${VOX_BENCH_CUDA_OPTS:-0}" == "1" ]]; then
+  echo "== extra CUDA variants (VOX_BENCH_CUDA_OPTS=1) =="
+  run_case cuda "cuda+graphs" VOX_CUDA_GRAPHS=1
+  run_case cuda "cuda+attn_v3" VOX_CUDA_ATTN_V3=1
+  run_case cuda "cuda+graphs+attn_v3" VOX_CUDA_GRAPHS=1 VOX_CUDA_ATTN_V3=1
+fi
 
 if [[ "$ran_blas" == "1" ]]; then
   echo "Done. Compare /tmp/voxtral_blas.txt and /tmp/voxtral_cuda.txt for transcript diffs."
