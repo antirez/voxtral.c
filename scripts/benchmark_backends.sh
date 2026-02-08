@@ -63,7 +63,11 @@ run_case() {
     /usr/bin/time -f "elapsed=%E cpu=%P maxrss_kb=%M" -o "/tmp/voxtral_${slug}.time" \
     ./voxtral -d "$MODEL_DIR" -i "$SAMPLE_WAV" --silent >"/tmp/voxtral_${slug}.txt" 2>"/tmp/voxtral_${slug}.err"
   cat "/tmp/voxtral_${slug}.time"
-  rg --no-line-number --no-heading '^(Model load:|Wall transcribe:|Encoder:|Decoder:)' "/tmp/voxtral_${slug}.err" || true
+  if command -v rg >/dev/null 2>&1; then
+    rg --no-line-number --no-heading '^(Model load:|Wall transcribe:|Encoder:|Decoder:)' "/tmp/voxtral_${slug}.err" || true
+  else
+    grep -E '^(Model load:|Wall transcribe:|Encoder:|Decoder:)' "/tmp/voxtral_${slug}.err" || true
+  fi
   # Some benchmark comparisons include model load in "total time". Provide an
   # apples-to-apples derived figure without requiring external math.
   load_ms="$(awk '/^Model load:/ {print $3}' "/tmp/voxtral_${slug}.err" | head -n1 || true)"

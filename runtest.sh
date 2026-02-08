@@ -33,6 +33,7 @@ PHRASES=(
     "consigliarvelo"
     "pubblicizzare i suoi prodotti"
     "alcuno sponsor"
+    # Prefix match: output can be "distribuzione" or "distribuzioni" depending on tokenization.
     "distribuzion"
     "mercati ortofrutticoli"
     "dove si trova"

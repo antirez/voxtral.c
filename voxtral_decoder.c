@@ -286,16 +286,26 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 #endif
 
     /* Working buffers (CPU fallback) */
-    float *x = (float *)malloc(seq_len * dim * sizeof(float));
-    memcpy(x, input_embeds, seq_len * dim * sizeof(float));
+    size_t x_bytes = (size_t)seq_len * (size_t)dim * sizeof(float);
+    float *x = (float *)malloc(x_bytes);
+    float *x_norm = (float *)malloc(x_bytes);
+    float *q = (float *)malloc((size_t)seq_len * (size_t)q_dim * sizeof(float));
+    float *k = (float *)malloc((size_t)seq_len * (size_t)kv_dim * sizeof(float));
+    float *v = (float *)malloc((size_t)seq_len * (size_t)kv_dim * sizeof(float));
+    float *attn_out = (float *)malloc((size_t)seq_len * (size_t)q_dim * sizeof(float));
+    float *proj_out = (float *)malloc(x_bytes);
+    float *ffn_out = (float *)malloc(x_bytes);
+    float *gate = (float *)malloc((size_t)seq_len * (size_t)hidden * sizeof(float));
+    float *up = (float *)malloc((size_t)seq_len * (size_t)hidden * sizeof(float));
 
-    float *x_norm = (float *)malloc(seq_len * dim * sizeof(float));
-    float *q = (float *)malloc(seq_len * q_dim * sizeof(float));
-    float *k = (float *)malloc(seq_len * kv_dim * sizeof(float));
-    float *v = (float *)malloc(seq_len * kv_dim * sizeof(float));
-    float *attn_out = (float *)malloc(seq_len * q_dim * sizeof(float));
-    float *proj_out = (float *)malloc(seq_len * dim * sizeof(float));
-    float *ffn_out = (float *)malloc(seq_len * dim * sizeof(float));
+    if (!x || !x_norm || !q || !k || !v || !attn_out || !proj_out || !ffn_out || !gate || !up) {
+        free(x); free(x_norm); free(q); free(k); free(v);
+        free(attn_out); free(proj_out); free(ffn_out);
+        free(gate); free(up);
+        free(positions); free(rope_freqs);
+        return;
+    }
+    memcpy(x, input_embeds, x_bytes);
 
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
@@ -370,15 +380,11 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         } else
 #endif
         {
-            /* CPU path needs separate gate/up buffers */
-            float *gate = (float *)malloc(seq_len * hidden * sizeof(float));
-            float *up = (float *)malloc(seq_len * hidden * sizeof(float));
             vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
             vox_silu(gate, seq_len * hidden);
             vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
             vox_mul_inplace(gate, up, seq_len * hidden);
             vox_linear_nobias_bf16(ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
-            free(gate); free(up);
         }
 
         /* Residual */
@@ -392,6 +398,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
     free(x); free(x_norm); free(q); free(k); free(v);
     free(attn_out); free(proj_out); free(ffn_out);
+    free(gate); free(up);
     free(positions); free(rope_freqs);
 }
 
