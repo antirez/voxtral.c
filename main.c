@@ -8,12 +8,16 @@
 #include "voxtral_kernels.h"
 #include "voxtral_audio.h"
 #include "voxtral_mic.h"
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <signal.h>
 #include <unistd.h>
 #include <math.h>
@@ -175,11 +179,22 @@ int main(int argc, char **argv) {
     vox_metal_init();
 #endif
 
+    const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
+    int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
+
     /* Load model */
+    struct timeval t0_load, t1_load;
+    gettimeofday(&t0_load, NULL);
     vox_ctx_t *ctx = vox_load(model_dir);
+    gettimeofday(&t1_load, NULL);
     if (!ctx) {
         fprintf(stderr, "Failed to load model from %s\n", model_dir);
         return 1;
+    }
+    if (force_timing) {
+        double load_ms = (t1_load.tv_sec - t0_load.tv_sec) * 1000.0 +
+                         (t1_load.tv_usec - t0_load.tv_usec) / 1000.0;
+        fprintf(stderr, "Model load: %.0f ms\n", load_ms);
     }
 
     vox_stream_t *s = vox_stream_init(ctx);
@@ -196,6 +211,9 @@ int main(int argc, char **argv) {
         if (feed_chunk < 160) feed_chunk = 160;
         if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
     }
+
+    struct timeval t0_run, t1_run;
+    if (!use_mic) gettimeofday(&t0_run, NULL);
 
     if (use_mic) {
         /* Microphone capture with silence cancellation */
@@ -290,6 +308,11 @@ int main(int argc, char **argv) {
         vox_mic_stop();
         if (vox_verbose >= 1)
             fprintf(stderr, "\nStopping...\n");
+
+        vox_stream_finish(s);
+        drain_tokens(s);
+        fputs("\n", stdout);
+        fflush(stdout);
     } else if (use_stdin) {
         /* Peek at first 4 bytes to detect WAV vs raw */
         uint8_t hdr[4];
@@ -360,6 +383,11 @@ int main(int argc, char **argv) {
                 drain_tokens(s);
             }
         }
+
+        vox_stream_finish(s);
+        drain_tokens(s);
+        fputs("\n", stdout);
+        fflush(stdout);
     } else {
         /* File input: load WAV, feed in chunks */
         int n_samples = 0;
@@ -376,17 +404,29 @@ int main(int argc, char **argv) {
 
         feed_and_drain(s, samples, n_samples);
         free(samples);
+
+        vox_stream_finish(s);
+        drain_tokens(s);
+        fputs("\n", stdout);
+        fflush(stdout);
     }
 
-    vox_stream_finish(s);
-    drain_tokens(s);
-    fputs("\n", stdout);
-    fflush(stdout);
+    if (!use_mic) {
+        gettimeofday(&t1_run, NULL);
+        if (force_timing) {
+            double run_ms = (t1_run.tv_sec - t0_run.tv_sec) * 1000.0 +
+                            (t1_run.tv_usec - t0_run.tv_usec) / 1000.0;
+            fprintf(stderr, "Wall transcribe: %.0f ms\n", run_ms);
+        }
+    }
 
     vox_stream_free(s);
     vox_free(ctx);
 #ifdef USE_METAL
     vox_metal_shutdown();
+#endif
+#ifdef USE_CUDA
+    vox_cuda_shutdown();
 #endif
     return 0;
 }
