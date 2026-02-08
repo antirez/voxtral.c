@@ -20,6 +20,10 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
 - BF16 weight caching on device:
   - Host BF16 pointers (mmap-backed) are used as stable cache keys.
   - Device cache is LRU-ish and sized conservatively based on free VRAM.
+- Cold-start improvements (weight upload / allocator overhead):
+  - Async device allocator + mempool (`cuMemAllocAsync`/`cuMemFreeAsync`): enabled by default when supported (disable with `VOX_DISABLE_CUDA_MEMPOOL=1` or `VOX_CUDA_MEMPOOL=0`).
+  - Optional host page registration for hot weight ranges: `VOX_CUDA_HOSTREG_GIB=<GiB>` (0 disables; best-effort).
+  - Optional prefetch at model load: `VOX_CUDA_PREFETCH=1` (shifts weight uploads out of the first transcription call).
 - Encoder full path:
   - CPU conv stem remains on CPU by default (small); optional GPU conv stem is available (opt-in).
   - Transformer layers + adapter run on GPU; intermediates stay on device.
