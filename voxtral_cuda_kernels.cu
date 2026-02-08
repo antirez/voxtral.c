@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <math.h>
 
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -1694,6 +1695,23 @@ extern "C" __global__ void vox_apply_rope_f32(float *x,
     float b = row[i1];
     row[i0] = a * c - b * si;
     row[i1] = a * si + b * c;
+}
+
+/* Generate RoPE freqs for a single logical position (used by CUDA Graph mode):
+ *   out[d,0]=cos(pos*inv_freq[d]), out[d,1]=sin(pos*inv_freq[d])
+ * where inv_freq[d] = 1/pow(theta,2d/head_dim) is precomputed on the host. */
+extern "C" __global__ void vox_rope_freqs_1pos_f32(float *out,
+                                                   const float *inv_freq,
+                                                   const int *pos_dev,
+                                                   int half_dim) {
+    int d = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (d >= half_dim) return;
+    float p = (float)(*pos_dev);
+    float angle = p * inv_freq[d];
+    float s, c;
+    sincosf(angle, &s, &c);
+    out[(size_t)d * 2] = c;
+    out[(size_t)d * 2 + 1] = s;
 }
 
 /* Build the decoder step embedding on-device:
