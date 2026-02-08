@@ -92,6 +92,14 @@ void vox_cuda_stream_adapter_reset(void);
  * build the initial decoder prompt on CPU without copying the full adapter. */
 int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens);
 
+/* Discard (logically) the first `consumed_tokens` adapter embeddings from the
+ * device-side adapter buffer.
+ *
+ * This is a no-copy operation in VOX_CUDA_PIPELINE_FULL mode (ring-buffer
+ * semantics), and is used to avoid unbounded growth of the adapter buffer in
+ * long streaming runs. */
+void vox_cuda_stream_adapter_compact(int consumed_tokens);
+
 /* Run CUDA full encoder+adapter and append the resulting adapter embeddings
  * to the internal device-side adapter buffer. Returns 1 on success. */
 int vox_cuda_encode_adapter_stream_append(int *out_tokens,

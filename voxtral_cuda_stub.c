@@ -96,6 +96,10 @@ int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens) {
     return 0;
 }
 
+void vox_cuda_stream_adapter_compact(int consumed_tokens) {
+    (void)consumed_tokens;
+}
+
 int vox_cuda_encode_adapter_stream_append(int *out_tokens,
                                           vox_ctx_t *ctx,
                                           const float *mel,

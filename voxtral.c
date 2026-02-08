@@ -734,13 +734,25 @@ static int stream_use_cuda_encoder_full(void) {
 #endif
 }
 
+static int stream_use_cuda_pipeline_full(void);
+
 /* Compact adapter buffer: discard tokens the decoder has already consumed */
 static void stream_adapter_compact(vox_stream_t *s) {
-    /* CUDA pipeline-full keeps the adapter on device; host adapter_buf is NULL. */
-    if (!s->adapter_buf) return;
-
     int consumed = s->gen_pos - s->adapter_pos_offset;
     if (consumed <= 0) return;
+
+#ifdef USE_CUDA
+    if (!s->adapter_buf) {
+        /* VOX_CUDA_PIPELINE_FULL keeps the adapter on-device. */
+        if (stream_use_cuda_pipeline_full()) {
+            vox_cuda_stream_adapter_compact(consumed);
+            s->adapter_pos_offset += consumed;
+        }
+        return;
+    }
+#else
+    if (!s->adapter_buf) return;
+#endif
 
     int dim = VOX_DEC_DIM;
     int remaining = (s->total_adapter - s->adapter_pos_offset) - consumed;

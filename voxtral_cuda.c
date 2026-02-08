@@ -36,6 +36,10 @@ static char g_device_name[256] = "unavailable";
 static int g_cc_major = 0;
 static int g_cc_minor = 0;
 
+/* Optional: small pinned host buffer for DtoH(best_token) to reduce per-step
+ * overhead under WSL2 (best-effort). */
+static int *g_host_best = NULL;
+
 /* Optional: use CUDA async allocation/mempool APIs to reduce per-weight alloc/free
  * overhead and avoid device-wide syncs during eviction. */
 static int g_use_mempool = 0;
@@ -175,6 +179,14 @@ static int attn_v3_disabled(void) {
     return cached;
 }
 
+static int cuda_fast_enabled(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *env = getenv("VOX_CUDA_FAST");
+    cached = (env && env[0] && env[0] != '0');
+    return cached;
+}
+
 static int attn_v3_enabled(void) {
     /* Opt-in: v3 is a chunked attention implementation that reduces redundant
      * KV loads under GQA. Keep behind a gate until it is validated broadly. */
@@ -182,7 +194,11 @@ static int attn_v3_enabled(void) {
     if (cached != -1) return cached;
     if (attn_v3_disabled()) { cached = 0; return cached; }
     const char *env = getenv("VOX_CUDA_ATTN_V3");
-    cached = (env && env[0] && env[0] != '0');
+    if (env) {
+        cached = (env[0] && env[0] != '0');
+        return cached;
+    }
+    cached = cuda_fast_enabled();
     return cached;
 }
 
@@ -194,16 +210,22 @@ static int env_truthy(const char *name) {
 static int merge_qkv_enabled(void) {
     static int cached = -1;
     if (cached != -1) return cached;
-    if (env_truthy("VOX_CUDA_MERGE_WEIGHTS")) { cached = 1; return cached; }
-    cached = env_truthy("VOX_CUDA_MERGE_QKV");
+    const char *all = getenv("VOX_CUDA_MERGE_WEIGHTS");
+    if (all) { cached = (all[0] && all[0] != '0'); return cached; }
+    const char *env = getenv("VOX_CUDA_MERGE_QKV");
+    if (env) { cached = (env[0] && env[0] != '0'); return cached; }
+    cached = cuda_fast_enabled();
     return cached;
 }
 
 static int merge_ffn13_enabled(void) {
     static int cached = -1;
     if (cached != -1) return cached;
-    if (env_truthy("VOX_CUDA_MERGE_WEIGHTS")) { cached = 1; return cached; }
-    cached = env_truthy("VOX_CUDA_MERGE_FFN13");
+    const char *all = getenv("VOX_CUDA_MERGE_WEIGHTS");
+    if (all) { cached = (all[0] && all[0] != '0'); return cached; }
+    const char *env = getenv("VOX_CUDA_MERGE_FFN13");
+    if (env) { cached = (env[0] && env[0] != '0'); return cached; }
+    cached = cuda_fast_enabled();
     return cached;
 }
 
@@ -212,7 +234,12 @@ static int rope_dev_enabled(void) {
      * eliminating CPU trig + a small HtoD copy per decode step. */
     static int cached = -1;
     if (cached != -1) return cached;
-    cached = env_truthy("VOX_CUDA_ROPE_DEV");
+    const char *env = getenv("VOX_CUDA_ROPE_DEV");
+    if (env) {
+        cached = (env[0] && env[0] != '0');
+        return cached;
+    }
+    cached = cuda_fast_enabled();
     return cached;
 }
 
@@ -462,7 +489,9 @@ static CUdeviceptr g_enc_adapter = 0;
 /* Optional: device-side adapter buffer for full streaming pipeline
  * (VOX_CUDA_PIPELINE_FULL=1). Holds float32 embeddings [n_tokens, VOX_DEC_DIM]. */
 static CUdeviceptr g_stream_adapter = 0;
-static int g_stream_adapter_len = 0;        /* in tokens */
+static int g_stream_adapter_logical_len = 0; /* total logical tokens produced */
+static int g_stream_adapter_pos_offset = 0;  /* logical position of the first retained token */
+static int g_stream_adapter_head = 0;        /* ring head slot (physical) */
 static int g_stream_adapter_cap_tokens = 0; /* in tokens */
 
 /* Optional CUDA conv stem buffers (encoder front-end). */
@@ -586,54 +615,114 @@ static int pipeline_adapter_cap_tokens(void) {
     return cached;
 }
 
-static int ensure_stream_adapter(int need_total_tokens) {
-    if (need_total_tokens <= 0) return 0;
+static int ensure_stream_adapter(int need_phys_tokens) {
+    if (need_phys_tokens <= 0) return 0;
     if (!vox_cuda_available()) return 0;
 
     int dim = VOX_DEC_DIM;
-    if (g_stream_adapter && g_stream_adapter_cap_tokens >= need_total_tokens) return 1;
+    int phys_len = g_stream_adapter_logical_len - g_stream_adapter_pos_offset;
+    if (phys_len < 0) phys_len = 0;
+
+    if (g_stream_adapter && g_stream_adapter_cap_tokens >= need_phys_tokens) return 1;
 
     int new_cap = g_stream_adapter_cap_tokens ? g_stream_adapter_cap_tokens : pipeline_adapter_cap_tokens();
-    while (new_cap < need_total_tokens) new_cap *= 2;
+    while (new_cap < need_phys_tokens) new_cap *= 2;
 
     size_t new_bytes = (size_t)new_cap * (size_t)dim * sizeof(float);
     CUdeviceptr new_dev = 0;
 
-    (void)cuCtxSetCurrent(g_ctx);
-    CUresult r = cuMemAlloc(&new_dev, new_bytes);
-    if (r != CUDA_SUCCESS) { log_cu_error("cuMemAlloc(stream_adapter)", r); return 0; }
+    if (!dev_alloc(&new_dev, new_bytes)) return 0;
 
-    if (g_stream_adapter && g_stream_adapter_len > 0) {
-        size_t copy_bytes = (size_t)g_stream_adapter_len * (size_t)dim * sizeof(float);
-        r = cuMemcpyDtoDAsync(new_dev, g_stream_adapter, copy_bytes, g_stream);
-        if (r != CUDA_SUCCESS) { log_cu_error("cuMemcpyDtoDAsync(stream_adapter_grow)", r); cuMemFree(new_dev); return 0; }
+    if (g_stream_adapter && phys_len > 0 && g_stream_adapter_cap_tokens > 0) {
+        int old_cap = g_stream_adapter_cap_tokens;
+        int head = g_stream_adapter_head;
+        if (head < 0 || head >= old_cap) head = 0;
+
+        int n0 = phys_len;
+        int contig = old_cap - head;
+        if (n0 > contig) n0 = contig;
+
+        size_t bytes0 = (size_t)n0 * (size_t)dim * sizeof(float);
+        CUdeviceptr src0 = g_stream_adapter + (size_t)head * (size_t)dim * sizeof(float);
+        CUresult r = cuMemcpyDtoDAsync(new_dev, src0, bytes0, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("cuMemcpyDtoDAsync(stream_adapter_grow0)", r); dev_free(new_dev); return 0; }
+
+        int rem = phys_len - n0;
+        if (rem > 0) {
+            size_t bytes1 = (size_t)rem * (size_t)dim * sizeof(float);
+            CUdeviceptr dst1 = new_dev + bytes0;
+            CUdeviceptr src1 = g_stream_adapter;
+            r = cuMemcpyDtoDAsync(dst1, src1, bytes1, g_stream);
+            if (r != CUDA_SUCCESS) { log_cu_error("cuMemcpyDtoDAsync(stream_adapter_grow1)", r); dev_free(new_dev); return 0; }
+        }
+
         r = cuStreamSynchronize(g_stream);
-        if (r != CUDA_SUCCESS) { log_cu_error("sync(stream_adapter_grow)", r); cuMemFree(new_dev); return 0; }
+        if (r != CUDA_SUCCESS) { log_cu_error("sync(stream_adapter_grow)", r); dev_free(new_dev); return 0; }
     }
-    if (g_stream_adapter) cuMemFree(g_stream_adapter);
+    if (g_stream_adapter) dev_free(g_stream_adapter);
 
     g_stream_adapter = new_dev;
     g_stream_adapter_cap_tokens = new_cap;
+    g_stream_adapter_head = 0;
     return 1;
 }
 
 void vox_cuda_stream_adapter_reset(void) {
     if (!vox_cuda_available()) return;
     (void)cuCtxSetCurrent(g_ctx);
-    g_stream_adapter_len = 0;
+    g_stream_adapter_logical_len = 0;
+    g_stream_adapter_pos_offset = 0;
+    g_stream_adapter_head = 0;
 }
 
 int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens) {
     if (!vox_cuda_available()) return 0;
     if (!out_host || n_tokens <= 0) return 0;
-    if (!g_stream_adapter || g_stream_adapter_len < n_tokens) return 0;
+    int phys_len = g_stream_adapter_logical_len - g_stream_adapter_pos_offset;
+    if (phys_len < n_tokens) return 0;
+    if (!g_stream_adapter || g_stream_adapter_cap_tokens <= 0) return 0;
     (void)cuCtxSetCurrent(g_ctx);
-    size_t bytes = (size_t)n_tokens * (size_t)VOX_DEC_DIM * sizeof(float);
-    CUresult r = cuMemcpyDtoHAsync(out_host, g_stream_adapter, bytes, g_stream);
-    if (r != CUDA_SUCCESS) { log_cu_error("DtoH(adapter_prompt)", r); return 0; }
+
+    int head = g_stream_adapter_head;
+    int cap = g_stream_adapter_cap_tokens;
+    if (head < 0 || head >= cap) head = 0;
+
+    int n0 = n_tokens;
+    int contig = cap - head;
+    if (n0 > contig) n0 = contig;
+
+    CUdeviceptr src0 = g_stream_adapter + (size_t)head * (size_t)VOX_DEC_DIM * sizeof(float);
+    size_t bytes0 = (size_t)n0 * (size_t)VOX_DEC_DIM * sizeof(float);
+    CUresult r = cuMemcpyDtoHAsync(out_host, src0, bytes0, g_stream);
+    if (r != CUDA_SUCCESS) { log_cu_error("DtoH(adapter_prompt0)", r); return 0; }
+
+    int rem = n_tokens - n0;
+    if (rem > 0) {
+        size_t bytes1 = (size_t)rem * (size_t)VOX_DEC_DIM * sizeof(float);
+        r = cuMemcpyDtoHAsync(out_host + (size_t)n0 * VOX_DEC_DIM, g_stream_adapter, bytes1, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("DtoH(adapter_prompt1)", r); return 0; }
+    }
     r = cuStreamSynchronize(g_stream);
     if (r != CUDA_SUCCESS) { log_cu_error("sync(adapter_prompt)", r); return 0; }
     return 1;
+}
+
+void vox_cuda_stream_adapter_compact(int consumed_tokens) {
+    if (!vox_cuda_available()) return;
+    if (consumed_tokens <= 0) return;
+    if (!g_stream_adapter || g_stream_adapter_cap_tokens <= 0) return;
+
+    int phys_len = g_stream_adapter_logical_len - g_stream_adapter_pos_offset;
+    if (phys_len <= 0) return;
+    if (consumed_tokens > phys_len) consumed_tokens = phys_len;
+
+    g_stream_adapter_head = (g_stream_adapter_head + consumed_tokens) % g_stream_adapter_cap_tokens;
+    g_stream_adapter_pos_offset += consumed_tokens;
+
+    /* Keep the empty state simple for future appends/copies. */
+    if (g_stream_adapter_pos_offset == g_stream_adapter_logical_len) {
+        g_stream_adapter_head = 0;
+    }
 }
 
 typedef struct {
@@ -1514,16 +1603,16 @@ static int launch_step_embed_from_adapter(CUdeviceptr dst,
                                           CUdeviceptr adapter,
                                           CUdeviceptr tok_emb_bf16,
                                           int token_id,
-                                          int logical_pos,
+                                          int adapter_slot,
                                           int dim) {
     if (!dst || !adapter || !tok_emb_bf16) return 0;
-    if (token_id < 0 || logical_pos < 0 || dim <= 0) return 0;
+    if (token_id < 0 || adapter_slot < 0 || dim <= 0) return 0;
     if (!cuda_load_kernel_module()) return 0;
     if (!g_fn_step_embed_from_adapter) return 0;
 
     int threads = 256;
     int blocks = (dim + threads - 1) / threads;
-    void *params[] = { &dst, &adapter, &tok_emb_bf16, &token_id, &logical_pos, &dim };
+    void *params[] = { &dst, &adapter, &tok_emb_bf16, &token_id, &adapter_slot, &dim };
     CUresult r = cuLaunchKernel(g_fn_step_embed_from_adapter,
                                 blocks, 1, 1,
                                 threads, 1, 1,
@@ -2043,6 +2132,15 @@ static void vox_cuda_init(void) {
         }
     }
 
+    /* Best-effort: pin a tiny host buffer used for the per-step best-token
+     * download. This is intentionally small (4 bytes) and optional. */
+    if (!g_host_best) {
+        void *tmp = NULL;
+        if (cuMemAllocHost(&tmp, sizeof(int)) == CUDA_SUCCESS) {
+            g_host_best = (int *)tmp;
+        }
+    }
+
     g_available = 1;
 }
 
@@ -2183,6 +2281,11 @@ void vox_cuda_shutdown(void) {
     if (!g_init) return;
 
     if (g_ctx) (void)cuCtxSetCurrent(g_ctx);
+
+    if (g_host_best) {
+        (void)cuMemFreeHost(g_host_best);
+        g_host_best = NULL;
+    }
 
     /* Decoder CUDA Graph resources (must be destroyed before freeing buffers they reference). */
     if (g_dec_graph_exec) cuGraphExecDestroy(g_dec_graph_exec);
@@ -2349,7 +2452,9 @@ void vox_cuda_shutdown(void) {
 
     shutdown_dev_free_ptr(&g_stream_adapter);
     g_stream_adapter = 0;
-    g_stream_adapter_len = 0;
+    g_stream_adapter_logical_len = 0;
+    g_stream_adapter_pos_offset = 0;
+    g_stream_adapter_head = 0;
     g_stream_adapter_cap_tokens = 0;
 
     if (g_mod) cuModuleUnload(g_mod);
@@ -3515,22 +3620,37 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
     /* Optional: full CUDA streaming pipeline keeps adapter output on device and
      * appends it to a device-side buffer (avoids a large DtoH copy). */
     if (pipeline_full_enabled()) {
-        int need_total = g_stream_adapter_len + ds_len;
-        if (ensure_stream_adapter(need_total)) {
-            CUdeviceptr dst = g_stream_adapter + (size_t)g_stream_adapter_len * (size_t)VOX_DEC_DIM * sizeof(float);
-            r = cuMemcpyDtoDAsync(dst, g_enc_adapter, bytes_mid, g_stream);
+        int phys_len = g_stream_adapter_logical_len - g_stream_adapter_pos_offset;
+        if (phys_len < 0) phys_len = 0;
+        int need_phys = phys_len + ds_len;
+        if (ensure_stream_adapter(need_phys)) {
+            int cap = g_stream_adapter_cap_tokens;
+            int tail = (g_stream_adapter_head + phys_len) % cap;
+
+            int n0 = ds_len;
+            int contig = cap - tail;
+            if (n0 > contig) n0 = contig;
+
+            size_t bytes0 = (size_t)n0 * (size_t)VOX_DEC_DIM * sizeof(float);
+            CUdeviceptr dst0 = g_stream_adapter + (size_t)tail * (size_t)VOX_DEC_DIM * sizeof(float);
+            CUdeviceptr src0 = g_enc_adapter;
+            r = cuMemcpyDtoDAsync(dst0, src0, bytes0, g_stream);
             if (r == CUDA_SUCCESS) {
-                r = cuStreamSynchronize(g_stream);
-                if (r == CUDA_SUCCESS) {
-                    g_stream_adapter_len = need_total;
-                    *out_tokens = ds_len;
-                    *out = NULL;
-                    return 1;
+                int rem = ds_len - n0;
+                if (rem > 0) {
+                    size_t bytes1 = (size_t)rem * (size_t)VOX_DEC_DIM * sizeof(float);
+                    CUdeviceptr dst1 = g_stream_adapter;
+                    CUdeviceptr src1 = g_enc_adapter + bytes0;
+                    r = cuMemcpyDtoDAsync(dst1, src1, bytes1, g_stream);
                 }
-                log_cu_error("sync(stream_adapter_append)", r);
-            } else {
-                log_cu_error("cuMemcpyDtoDAsync(stream_adapter_append)", r);
             }
+            if (r == CUDA_SUCCESS) {
+                g_stream_adapter_logical_len += ds_len;
+                *out_tokens = ds_len;
+                *out = NULL;
+                return 1;
+            }
+            log_cu_error("cuMemcpy*Async(stream_adapter_append)", r);
         }
         /* Fall back to the regular host-output path if device buffering fails. */
     }
@@ -3566,17 +3686,36 @@ int vox_cuda_encode_adapter_stream_append(int *out_tokens,
      * appended to the device-side adapter buffer and returned host_out==NULL.
      * If it fell back to host output, upload+append here as a slow fallback. */
     if (tokens > 0 && host_out) {
-        int need_total = g_stream_adapter_len + tokens;
-        if (!ensure_stream_adapter(need_total)) { free(host_out); return 0; }
-        CUdeviceptr dst = g_stream_adapter + (size_t)g_stream_adapter_len * (size_t)VOX_DEC_DIM * sizeof(float);
-        size_t bytes = (size_t)tokens * (size_t)VOX_DEC_DIM * sizeof(float);
+        int phys_len = g_stream_adapter_logical_len - g_stream_adapter_pos_offset;
+        if (phys_len < 0) phys_len = 0;
+        int need_phys = phys_len + tokens;
+        if (!ensure_stream_adapter(need_phys)) { free(host_out); return 0; }
+        int cap = g_stream_adapter_cap_tokens;
+        int tail = (g_stream_adapter_head + phys_len) % cap;
+
         (void)cuCtxSetCurrent(g_ctx);
-        CUresult r = cuMemcpyHtoDAsync(dst, host_out, bytes, g_stream);
-        if (r != CUDA_SUCCESS) { log_cu_error("HtoD(stream_adapter_from_host)", r); free(host_out); return 0; }
+        int n0 = tokens;
+        int contig = cap - tail;
+        if (n0 > contig) n0 = contig;
+
+        size_t bytes0 = (size_t)n0 * (size_t)VOX_DEC_DIM * sizeof(float);
+        CUdeviceptr dst0 = g_stream_adapter + (size_t)tail * (size_t)VOX_DEC_DIM * sizeof(float);
+
+        CUresult r = cuMemcpyHtoDAsync(dst0, host_out, bytes0, g_stream);
+        if (r != CUDA_SUCCESS) { log_cu_error("HtoD(stream_adapter_from_host0)", r); free(host_out); return 0; }
+
+        int rem = tokens - n0;
+        if (rem > 0) {
+            size_t bytes1 = (size_t)rem * (size_t)VOX_DEC_DIM * sizeof(float);
+            CUdeviceptr dst1 = g_stream_adapter;
+            r = cuMemcpyHtoDAsync(dst1, host_out + (size_t)n0 * VOX_DEC_DIM, bytes1, g_stream);
+            if (r != CUDA_SUCCESS) { log_cu_error("HtoD(stream_adapter_from_host1)", r); free(host_out); return 0; }
+        }
+
         r = cuStreamSynchronize(g_stream);
         free(host_out);
         if (r != CUDA_SUCCESS) { log_cu_error("sync(stream_adapter_from_host)", r); return 0; }
-        g_stream_adapter_len = need_total;
+        g_stream_adapter_logical_len += tokens;
     } else {
         free(host_out);
     }
@@ -3587,7 +3726,9 @@ int vox_cuda_encode_adapter_stream_append(int *out_tokens,
 
 static int decoder_graph_wanted(void) {
     if (env_truthy("VOX_DISABLE_CUDA_GRAPHS")) return 0;
-    return env_truthy("VOX_CUDA_GRAPHS");
+    const char *env = getenv("VOX_CUDA_GRAPHS");
+    if (env) return (env[0] && env[0] != '0');
+    return cuda_fast_enabled();
 }
 
 static int attn_v3_wanted_for_graph(void) {
@@ -4119,8 +4260,10 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
     r = cuGraphLaunch(g_dec_graph_exec, g_stream);
     if (r != CUDA_SUCCESS) { log_cu_error("cuGraphLaunch(decoder)", r); return 0; }
 
-    int best = 2;
-    r = cuMemcpyDtoHAsync(&best, g_dec_best, sizeof(best), g_stream);
+    int best_local = 2;
+    int *best_ptr = g_host_best ? g_host_best : &best_local;
+    *best_ptr = 2;
+    r = cuMemcpyDtoHAsync(best_ptr, g_dec_best, sizeof(int), g_stream);
     if (r != CUDA_SUCCESS) { log_cu_error("DtoH(best_graph)", r); return 0; }
 
     if (logits_or_null) {
@@ -4132,7 +4275,7 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
     if (r != CUDA_SUCCESS) { log_cu_error("sync(decoder_graph)", r); return 0; }
 
     ctx->kv_cache_len = total_seq;
-    *out_token = best;
+    *out_token = *best_ptr;
     return 1;
 }
 
@@ -4333,8 +4476,10 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
 
     if (!launch_argmax(g_dec_best, g_dec_logits, VOX_VOCAB_SIZE)) return 0;
 
-    int best = 2;
-    r = cuMemcpyDtoHAsync(&best, g_dec_best, sizeof(best), g_stream);
+    int best_local = 2;
+    int *best_ptr = g_host_best ? g_host_best : &best_local;
+    *best_ptr = 2;
+    r = cuMemcpyDtoHAsync(best_ptr, g_dec_best, sizeof(int), g_stream);
     if (r != CUDA_SUCCESS) { log_cu_error("DtoH(best)", r); return 0; }
 
     if (logits_or_null) {
@@ -4346,7 +4491,7 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
     if (r != CUDA_SUCCESS) { log_cu_error("sync(decoder_full)", r); return 0; }
 
     ctx->kv_cache_len = total_seq;
-    *out_token = best;
+    *out_token = *best_ptr;
     return 1;
 }
 
@@ -4370,7 +4515,7 @@ int vox_cuda_decoder_forward_from_stream_adapter(int *out_token,
     if (disable && disable[0] && disable[0] != '0') return 0;
     if (!ctx) return 0;
     if (!cuda_load_kernel_module()) return 0;
-    if (!g_stream_adapter || g_stream_adapter_len <= 0) return 0;
+    if (!g_stream_adapter || g_stream_adapter_cap_tokens <= 0) return 0;
     if (prev_token < 0 || prev_token >= VOX_VOCAB_SIZE) return 0;
 
     int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM; /* 1024 */
@@ -4392,7 +4537,14 @@ int vox_cuda_decoder_forward_from_stream_adapter(int *out_token,
 
     int pos = ctx->kv_cache_len;
     int logical_pos = ctx->kv_pos_offset + pos;
-    if (logical_pos < 0 || logical_pos >= g_stream_adapter_len) return 0;
+
+    int phys_len = g_stream_adapter_logical_len - g_stream_adapter_pos_offset;
+    if (phys_len <= 0) return 0;
+    if (logical_pos < g_stream_adapter_pos_offset || logical_pos >= g_stream_adapter_logical_len) return 0;
+
+    int rel = logical_pos - g_stream_adapter_pos_offset;
+    if (rel < 0 || rel >= phys_len) return 0;
+    int slot = (g_stream_adapter_head + rel) % g_stream_adapter_cap_tokens;
 
     (void)cuCtxSetCurrent(g_ctx);
 
@@ -4404,7 +4556,7 @@ int vox_cuda_decoder_forward_from_stream_adapter(int *out_token,
     CUdeviceptr dTok = bf16_cache_get(ctx->decoder.tok_embeddings_bf16, bytes_emb);
     if (!dTok) return 0;
 
-    if (!launch_step_embed_from_adapter(g_dec_x, g_stream_adapter, dTok, prev_token, logical_pos, dim)) return 0;
+    if (!launch_step_embed_from_adapter(g_dec_x, g_stream_adapter, dTok, prev_token, slot, dim)) return 0;
 
     return vox_cuda_decoder_forward_full_impl(out_token, logits_or_null, ctx, NULL, 1);
 }
