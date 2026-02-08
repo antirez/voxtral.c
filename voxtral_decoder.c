@@ -129,6 +129,7 @@ static int kv_cache_init(vox_ctx_t *ctx, int max_seq) {
         ctx->kv_cache_v = (float *)calloc(1, cache_size);
     }
     ctx->kv_cache_len = 0;
+    ctx->kv_cache_host_valid_len = 0;
     ctx->kv_cache_max = max_seq;
     /* kv_pos_offset is NOT reset here — caller manages it */
 
@@ -229,6 +230,15 @@ static void kv_cache_compact(vox_ctx_t *ctx) {
     vox_cuda_kv_cache_compact(discard, keep, kv_dim, ctx->kv_cache_max);
 #endif
 
+    /* Host KV cache validity shifts with the compaction window. */
+    int old_valid = ctx->kv_cache_host_valid_len;
+    if (old_valid < 0) old_valid = 0;
+    if (old_valid > ctx->kv_cache_len) old_valid = ctx->kv_cache_len;
+    int new_valid = old_valid - discard;
+    if (new_valid < 0) new_valid = 0;
+    if (new_valid > keep) new_valid = keep;
+    ctx->kv_cache_host_valid_len = new_valid;
+
     ctx->kv_pos_offset += discard;
     ctx->kv_cache_len = keep;
 }
@@ -271,6 +281,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         if (!x) { free(positions); free(rope_freqs); return; }
         memcpy(x, input_embeds, seq_len * dim * sizeof(float));
         vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
+        ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
         free(x);
         free(positions); free(rope_freqs);
         return;
@@ -279,6 +290,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
 
 #ifdef USE_CUDA
     if (vox_cuda_decoder_prefill_full(ctx, input_embeds, seq_len, rope_freqs)) {
+        ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
         free(positions);
         free(rope_freqs);
         return;
@@ -395,6 +407,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     }
 
     ctx->kv_cache_len = start_pos + seq_len;
+    ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
 
     free(x); free(x_norm); free(q); free(k); free(v);
     free(attn_out); free(proj_out); free(ffn_out);
@@ -463,6 +476,19 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         int tok = 2;
         if (vox_cuda_decoder_forward_full(&tok, logits, ctx, input_embeds)) {
             return tok;
+        }
+
+        /* If CUDA-full generated previous tokens, host KV may be stale.
+         * Download device KV before falling back to CPU attention. */
+        if (ctx->kv_cache_host_valid_len < ctx->kv_cache_len) {
+            int start = ctx->kv_cache_host_valid_len;
+            if (start < 0) start = 0;
+            if (start > ctx->kv_cache_len) start = ctx->kv_cache_len;
+            int n_pos = ctx->kv_cache_len - start;
+            if (n_pos > 0) {
+                if (!vox_cuda_kv_cache_download_host(ctx, start, n_pos)) return 2; /* EOS on error */
+            }
+            ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
         }
     }
 #endif
@@ -553,6 +579,7 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
     }
 
     ctx->kv_cache_len = pos + 1;
+    ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
 
     vox_rms_norm(x, x, dec->norm, 1, dim, VOX_DEC_NORM_EPS);
     vox_matmul_t_bf16(logits_buf, x, dec->tok_embeddings_bf16, 1, dim, VOX_VOCAB_SIZE);

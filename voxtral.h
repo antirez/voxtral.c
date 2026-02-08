@@ -164,6 +164,7 @@ typedef struct {
     float *kv_cache_k;       /* [layers, max_seq, kv_heads * head_dim] */
     float *kv_cache_v;       /* [layers, max_seq, kv_heads * head_dim] */
     int kv_cache_len;        /* Current physical cache length */
+    int kv_cache_host_valid_len; /* Host KV cache prefix that is valid. CUDA-full keeps KV on-device and may leave host stale. */
     int kv_cache_max;        /* Maximum cache size */
     int kv_pos_offset;       /* Logical position offset (positions discarded by compaction) */
 

@@ -215,6 +215,29 @@ static uint16_t f32_to_f16bits(float x) {
 #endif
 }
 
+static float f16bits_to_f32(uint16_t hbits) {
+#if defined(__FLT16_MANT_DIG__)
+    _Float16 h;
+    memcpy(&h, &hbits, sizeof(h));
+    return (float)h;
+#else
+    /* Portable fallback: IEEE754 half -> float. This is not a hot path. */
+    uint32_t sign = (uint32_t)(hbits >> 15) & 1u;
+    uint32_t exp = (uint32_t)(hbits >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)hbits & 0x3FFu;
+
+    float out;
+    if (exp == 0) {
+        out = mant ? ldexpf((float)mant, -24) : 0.0f;
+    } else if (exp == 31u) {
+        out = mant ? NAN : INFINITY;
+    } else {
+        out = ldexpf(1.0f + ((float)mant / 1024.0f), (int)exp - 15);
+    }
+    return sign ? -out : out;
+#endif
+}
+
 static CUdeviceptr g_dQ = 0;
 static CUdeviceptr g_dAttn = 0;
 static size_t g_cap_q = 0;
@@ -2083,6 +2106,73 @@ void vox_cuda_kv_cache_append_block(int layer, int start_pos, int seq_len,
     }
 }
 
+int vox_cuda_kv_cache_download_host(vox_ctx_t *ctx, int start_pos, int n_pos) {
+    if (!vox_cuda_available()) return 0;
+    if (!ctx) return 0;
+    if (start_pos < 0 || n_pos <= 0) return 0;
+    if (!ctx->kv_cache_k || !ctx->kv_cache_v) return 0;
+    if (ctx->kv_cache_max <= 0) return 0;
+    if (start_pos + n_pos > ctx->kv_cache_len) return 0;
+
+    if (!g_k_cache || !g_v_cache || g_kv_max_seq <= 0 || g_kv_dim <= 0) return 0;
+
+    int kv_dim = VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM;
+    if (g_kv_dim != kv_dim) return 0;
+    if (start_pos + n_pos > g_kv_max_seq) return 0;
+
+    (void)cuCtxSetCurrent(g_ctx);
+
+    size_t eb = g_kv_elem_bytes ? g_kv_elem_bytes : sizeof(float);
+    size_t layer_stride = (size_t)g_kv_max_seq * (size_t)kv_dim * eb;
+    size_t off = (size_t)start_pos * (size_t)kv_dim * eb;
+
+    size_t host_stride = (size_t)ctx->kv_cache_max * (size_t)kv_dim;
+    size_t count = (size_t)n_pos * (size_t)kv_dim;
+
+    if (eb == sizeof(float)) {
+        size_t bytes = count * sizeof(float);
+        for (int l = 0; l < VOX_DEC_LAYERS; l++) {
+            CUdeviceptr dk = g_k_cache + (size_t)l * layer_stride + off;
+            CUdeviceptr dv = g_v_cache + (size_t)l * layer_stride + off;
+            float *hk = ctx->kv_cache_k + (size_t)l * host_stride + (size_t)start_pos * (size_t)kv_dim;
+            float *hv = ctx->kv_cache_v + (size_t)l * host_stride + (size_t)start_pos * (size_t)kv_dim;
+            CUresult r = cuMemcpyDtoH(hk, dk, bytes);
+            if (r != CUDA_SUCCESS) { log_cu_error("DtoH(kv_k_f32)", r); return 0; }
+            r = cuMemcpyDtoH(hv, dv, bytes);
+            if (r != CUDA_SUCCESS) { log_cu_error("DtoH(kv_v_f32)", r); return 0; }
+        }
+        return 1;
+    }
+
+    if (eb != sizeof(uint16_t)) return 0;
+
+    size_t bytes = count * sizeof(uint16_t);
+    uint16_t *tmpk = (uint16_t *)malloc(bytes);
+    uint16_t *tmpv = (uint16_t *)malloc(bytes);
+    if (!tmpk || !tmpv) { free(tmpk); free(tmpv); return 0; }
+
+    for (int l = 0; l < VOX_DEC_LAYERS; l++) {
+        CUdeviceptr dk = g_k_cache + (size_t)l * layer_stride + off;
+        CUdeviceptr dv = g_v_cache + (size_t)l * layer_stride + off;
+        float *hk = ctx->kv_cache_k + (size_t)l * host_stride + (size_t)start_pos * (size_t)kv_dim;
+        float *hv = ctx->kv_cache_v + (size_t)l * host_stride + (size_t)start_pos * (size_t)kv_dim;
+
+        CUresult r = cuMemcpyDtoH(tmpk, dk, bytes);
+        if (r != CUDA_SUCCESS) { log_cu_error("DtoH(kv_k_f16)", r); free(tmpk); free(tmpv); return 0; }
+        r = cuMemcpyDtoH(tmpv, dv, bytes);
+        if (r != CUDA_SUCCESS) { log_cu_error("DtoH(kv_v_f16)", r); free(tmpk); free(tmpv); return 0; }
+
+        for (size_t i = 0; i < count; i++) {
+            hk[i] = f16bits_to_f32(tmpk[i]);
+            hv[i] = f16bits_to_f32(tmpv[i]);
+        }
+    }
+
+    free(tmpk);
+    free(tmpv);
+    return 1;
+}
+
 static int vox_cuda_kv_cache_append_block_dev(int layer, int start_pos, int seq_len,
                                               int kv_dim, int window_size,
                                               CUdeviceptr dK_f32, CUdeviceptr dV_f32) {
@@ -3897,6 +3987,7 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
     if (r != CUDA_SUCCESS) { log_cu_error("sync(dec_prefill)", r); return 0; }
 
     ctx->kv_cache_len = start_pos + seq_len;
+    ctx->kv_cache_host_valid_len = ctx->kv_cache_len;
     return 1;
 }
 

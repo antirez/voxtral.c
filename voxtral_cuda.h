@@ -54,6 +54,11 @@ void vox_cuda_kv_cache_append_block(int layer, int start_pos, int seq_len,
                                     int kv_dim, int window_size,
                                     const float *k, const float *v);
 
+/* Download device-side decoder KV cache back into ctx->kv_cache_{k,v} for CPU
+ * fallback after CUDA-full generation (which keeps KV on-device). Returns 1 on
+ * success, 0 on failure. */
+int vox_cuda_kv_cache_download_host(vox_ctx_t *ctx, int start_pos, int n_pos);
+
 /* Generic causal attention on GPU (float32 Q,K,V).
  * Returns 1 on success, 0 on fallback.
  */

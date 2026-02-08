@@ -1084,6 +1084,7 @@ static void stream_run_decoder(vox_stream_t *s) {
         }
 
         s->ctx->kv_cache_len = 0;
+        s->ctx->kv_cache_host_valid_len = 0;
         s->ctx->kv_pos_offset = 0;
 #ifdef USE_CUDA
         vox_cuda_kv_cache_reset();
