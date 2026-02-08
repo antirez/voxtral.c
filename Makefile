@@ -7,7 +7,7 @@ LDFLAGS = -lm
 
 # OpenMP (Linux only). Helps a lot for CPU-side attention + elementwise ops.
 # Disable with: make <target> OPENMP=0
-OPENMP ?= 0
+OPENMP ?= 1
 
 # CUDA toolkit location (override with: make cuda CUDA_HOME=/path/to/cuda)
 CUDA_HOME ?= /usr/local/cuda
@@ -26,8 +26,12 @@ endif
 
 # Source files
 # - voxtral_mic_macos.c contains macOS implementation + non-macOS stubs.
-SRCS = voxtral.c voxtral_kernels.c voxtral_cuda.c voxtral_audio.c voxtral_encoder.c voxtral_decoder.c \
-       voxtral_tokenizer.c voxtral_safetensors.c voxtral_mic_macos.c
+# - voxtral_cuda_stub.c provides non-CUDA stubs so CPU/Metal builds don't
+#   compile or link against the real CUDA implementation by accident.
+SRCS_COMMON = voxtral.c voxtral_kernels.c voxtral_audio.c voxtral_encoder.c voxtral_decoder.c \
+              voxtral_tokenizer.c voxtral_safetensors.c voxtral_mic_macos.c voxtral_cuda_stub.c
+CUDA_SRCS = $(SRCS_COMMON) voxtral_cuda.c
+SRCS = $(SRCS_COMMON)
 OBJS = $(SRCS:.c=.o)
 MAIN = main.c
 TARGET = voxtral
@@ -37,6 +41,9 @@ TARGET = voxtral
 # break PTX loading).
 CUDA_CUBIN = voxtral_cuda_kernels.cubin
 CUDA_CUBIN_HDR = voxtral_cuda_kernels_cubin.h
+# Note: the embedded CUBIN is arch-specific. Override as needed, e.g.:
+#   make cuda CUDA_ARCH=sm_80   # A100
+#   make cuda CUDA_ARCH=sm_89   # RTX 4090
 CUDA_ARCH ?= sm_86
 
 # Debug build flags
@@ -93,7 +100,7 @@ CUDA_LDFLAGS = $(LDFLAGS) -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib64/stubs -lcubl
 cuda: cuda-check
 	@$(MAKE) clean
 	@$(MAKE) $(CUDA_CUBIN_HDR)
-	@$(MAKE) $(TARGET) CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)"
+	@$(MAKE) $(TARGET) SRCS="$(CUDA_SRCS)" CFLAGS="$(CUDA_CFLAGS)" LDFLAGS="$(CUDA_LDFLAGS)"
 	@echo ""
 	@echo "Built with CUDA backend (cuBLAS)"
 
@@ -174,7 +181,7 @@ test:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -f $(OBJS) voxtral_cuda.o *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
 	rm -f voxtral_shaders_source.h
 	rm -f $(CUDA_CUBIN) $(CUDA_CUBIN_HDR)
 

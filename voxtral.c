@@ -436,6 +436,10 @@ struct vox_stream {
     int eos_seen;
     int finished;       /* vox_stream_finish() called */
 
+    /* Stream lifecycle flags */
+    int init_ok;        /* used to suppress stats printing for failed init */
+    int cuda_pipeline_full_lock_held; /* VOX_CUDA_PIPELINE_FULL is global+not thread-safe */
+
     /* Pending token queue (circular buffer, VOX_MAX_ALT strings per position) */
     const char **token_queue;   /* [queue_cap * VOX_MAX_ALT] */
     int queue_head;     /* next position to read */
@@ -461,6 +465,22 @@ struct vox_stream {
     int n_generated;
     int n_text_tokens;          /* tokens with ID >= 1000 (visible text) */
 };
+
+#ifdef USE_CUDA
+/* VOX_CUDA_PIPELINE_FULL uses a global device-side adapter buffer, so it isn't
+ * safe to run concurrently across multiple streams. Enforce single-stream use. */
+static int g_cuda_pipeline_full_in_use = 0;
+
+static int cuda_pipeline_full_acquire(void) {
+    int expected = 0;
+    return __atomic_compare_exchange_n(&g_cuda_pipeline_full_in_use, &expected, 1, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+static void cuda_pipeline_full_release(void) {
+    __atomic_store_n(&g_cuda_pipeline_full_in_use, 0, __ATOMIC_SEQ_CST);
+}
+#endif
 
 /* Enqueue one token position. alts[0]=best, alts[1..VOX_MAX_ALT-1]=alternatives or NULL. */
 static void stream_enqueue_token(vox_stream_t *s, const char *alts[VOX_MAX_ALT]) {
@@ -745,6 +765,18 @@ static int stream_use_cuda_pipeline_full(void) {
 #else
     return 0;
 #endif
+}
+
+/* Streaming EOS handling:
+ * - Default behavior is to treat EOS as provisional until finish() is called,
+ *   so long-running streams (e.g. microphone) don't get stuck after a flush.
+ * - Set VOX_STREAM_STRICT_EOS=1 to stop decoding as soon as EOS is produced. */
+static int stream_strict_eos(void) {
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *env = getenv("VOX_STREAM_STRICT_EOS");
+    cached = (env && env[0] && env[0] != '0');
+    return cached;
 }
 
 /* Run encoder on available mel, append adapter tokens */
@@ -1038,7 +1070,7 @@ static void stream_run_decoder(vox_stream_t *s) {
     int dim = VOX_DEC_DIM;
     int prompt_len = 1 + 32 + s->ctx->delay_tokens;
     uint16_t *tok_emb_bf16 = s->ctx->decoder.tok_embeddings_bf16;
-    const int eos_is_terminal = s->finished; /* EOS is only final once input is finished (offline right-pad added). */
+    const int eos_is_terminal = (s->finished || stream_strict_eos());
     float *logits_out = (s->n_alt > 1) ? s->logits : NULL;
 
     /* Prefill when we have enough adapter tokens */
@@ -1182,9 +1214,17 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
     s->ctx = ctx;
 
 #ifdef USE_CUDA
-    /* Full CUDA pipeline uses a global device-side adapter buffer; ensure it
-     * starts clean for each new stream. */
+    /* Full CUDA pipeline uses a global device-side adapter buffer and is not
+     * thread-safe across multiple concurrent streams. */
     if (stream_use_cuda_pipeline_full()) {
+        if (!cuda_pipeline_full_acquire()) {
+            fprintf(stderr,
+                    "Error: VOX_CUDA_PIPELINE_FULL=1 is single-stream only (global adapter buffer). "
+                    "Disable it or serialize streams.\n");
+            vox_stream_free(s);
+            return NULL;
+        }
+        s->cuda_pipeline_full_lock_held = 1;
         vox_cuda_stream_adapter_reset();
     }
 #endif
@@ -1193,13 +1233,12 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
     char tok_path[1024];
     snprintf(tok_path, sizeof(tok_path), "%s/tekken.json", ctx->model_dir);
     s->tokenizer = vox_tokenizer_load(tok_path);
-    if (!s->tokenizer) { free(s); return NULL; }
+    if (!s->tokenizer) { vox_stream_free(s); return NULL; }
 
     /* Initialize incremental mel with 32 left-pad tokens of silence */
     s->mel_ctx = vox_mel_ctx_init(32 * RAW_AUDIO_LENGTH_PER_TOK);
     if (!s->mel_ctx) {
-        vox_tokenizer_free(s->tokenizer);
-        free(s);
+        vox_stream_free(s);
         return NULL;
     }
 
@@ -1244,6 +1283,7 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
         }
     }
 
+    s->init_ok = 1;
     return s;
 }
 
@@ -1319,7 +1359,7 @@ void vox_stream_free(vox_stream_t *s) {
     /* Print stats after caller has drained all tokens */
     const char *force_timing_env = getenv("VOX_PRINT_TIMINGS");
     int force_timing = (force_timing_env && force_timing_env[0] && force_timing_env[0] != '0');
-    if (vox_verbose >= 1 || force_timing) {
+    if (s->init_ok && (vox_verbose >= 1 || force_timing)) {
         fprintf(stderr, "Encoder: %d mel -> %d tokens (%.0f ms)\n",
                 s->mel_cursor, s->total_adapter, s->encoder_ms);
         if (s->n_text_tokens > 0) {
@@ -1333,9 +1373,11 @@ void vox_stream_free(vox_stream_t *s) {
     }
 
 #ifdef USE_CUDA
-    /* Avoid leaking pipeline state into the next run (device-side adapter is global). */
-    if (stream_use_cuda_pipeline_full()) {
+    /* VOX_CUDA_PIPELINE_FULL uses a global device-side adapter buffer. */
+    if (s->cuda_pipeline_full_lock_held) {
         vox_cuda_stream_adapter_reset();
+        cuda_pipeline_full_release();
+        s->cuda_pipeline_full_lock_held = 0;
     }
 #endif
 
