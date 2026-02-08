@@ -32,7 +32,9 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - Faster per-token attention kernel (online softmax, warp-synchronous).
   - Optional attention v2 kernel variant (vectorized loads/stores; opt-in).
   - Optional attention v3 kernel variant (chunked reduction + GQA shared-load; opt-in).
+  - Optional merged decoder projections (QKV and FFN W1+W3) to reduce GEMM launches (opt-in).
   - Optional CUDA Graph capture for the single-token decoder step (reduces CPU launch overhead; opt-in).
+  - Optional device RoPE freqs generation for CUDA Graph mode (reduces CPU overhead per step; opt-in).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
   - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
 
@@ -141,6 +143,38 @@ On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), v3 is a
 - Without graphs: decoder `19.6 -> 14.8 ms/step` (`16254 -> 12594 ms` total decoder time)
 - With graphs: decoder `18.6 -> 13.7 ms/step` (`15537 -> 11776 ms` total decoder time)
 
+### Merged Decoder Projections (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_MERGE_WEIGHTS=1
+```
+
+Notes:
+- `VOX_CUDA_MERGE_WEIGHTS=1` enables both:
+  - merged QKV projection (one GEMM per layer instead of 3)
+  - merged FFN W1+W3 projection (one GEMM per layer instead of 2)
+- You can also enable them individually:
+  - `VOX_CUDA_MERGE_QKV=1`
+  - `VOX_CUDA_MERGE_FFN13=1`
+
+On `samples/antirez_speaking_italian_short.ogg` (~60s), combined with CUDA Graphs and v3 attention, merged projections reduced per-step decoder time further (numbers from `./runtest.sh`):
+
+- Graphs+v3 (no merged weights): decoder ~`13.7 ms/step`
+- Graphs+v3+merged weights: decoder ~`12.8 ms/step`
+
+### Device RoPE For CUDA Graphs (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_ROPE_DEV=1
+```
+
+When enabled (and if the optional kernel is available), CUDA Graph mode generates the RoPE freqs on-device inside the captured graph:
+- Upload `logical_pos` (4 bytes) instead of computing trig on CPU and uploading the RoPE freqs (~512 bytes) per step.
+
 ### GPU Conv Stem (opt-in)
 
 Enable with:
@@ -210,6 +244,12 @@ Nsight Systems (`nsys`) on a short run shows heavy use of tensor-core BF16 GEMM 
   - `VOX_CUDA_GRAPHS=1`
 - Disable CUDA Graphs (force non-graph path):
   - `VOX_DISABLE_CUDA_GRAPHS=1`
+- Enable merged decoder weights (reduces GEMM launches; opt-in):
+  - `VOX_CUDA_MERGE_WEIGHTS=1`
+  - `VOX_CUDA_MERGE_QKV=1`
+  - `VOX_CUDA_MERGE_FFN13=1`
+- Enable device RoPE freqs generation for CUDA Graph mode (opt-in):
+  - `VOX_CUDA_ROPE_DEV=1`
 - Disable full CUDA encoder+adapter:
   - `VOX_DISABLE_CUDA_ENCODER_FULL=1`
 - Disable full CUDA decoder path:

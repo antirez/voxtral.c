@@ -103,6 +103,10 @@ if [[ "${VOX_BENCH_CUDA_OPTS:-0}" == "1" ]]; then
   run_case cuda "cuda+graphs" VOX_CUDA_GRAPHS=1
   run_case cuda "cuda+attn_v3" VOX_CUDA_ATTN_V3=1
   run_case cuda "cuda+graphs+attn_v3" VOX_CUDA_GRAPHS=1 VOX_CUDA_ATTN_V3=1
+  run_case cuda "cuda+merged_weights" VOX_CUDA_MERGE_WEIGHTS=1
+  run_case cuda "cuda+graphs+merged_weights" VOX_CUDA_GRAPHS=1 VOX_CUDA_MERGE_WEIGHTS=1
+  run_case cuda "cuda+graphs+merged_weights+rope_dev" VOX_CUDA_GRAPHS=1 VOX_CUDA_MERGE_WEIGHTS=1 VOX_CUDA_ROPE_DEV=1
+  run_case cuda "cuda+opt_all" VOX_CUDA_GRAPHS=1 VOX_CUDA_ATTN_V3=1 VOX_CUDA_MERGE_WEIGHTS=1 VOX_CUDA_ROPE_DEV=1
 fi
 
 if [[ "$ran_blas" == "1" ]]; then
