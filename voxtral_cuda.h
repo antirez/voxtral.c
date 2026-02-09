@@ -38,7 +38,8 @@ int vox_cuda_linear2_bf16(float *y0, float *y1,
  *
  * Returns 1 on success, 0 on fallback.
  */
-int vox_cuda_attention_step(float *attn_out,
+int vox_cuda_attention_step(vox_ctx_t *ctx,
+                            float *attn_out,
                             const float *q,
                             const float *k,
                             const float *v,
@@ -48,9 +49,9 @@ int vox_cuda_attention_step(float *attn_out,
                             int window_size);
 
 /* Keep CUDA-side KV cache in sync with CPU KV cache compactions/resets. */
-void vox_cuda_kv_cache_compact(int discard, int keep, int kv_dim, int max_seq);
-void vox_cuda_kv_cache_reset(void);
-void vox_cuda_kv_cache_append_block(int layer, int start_pos, int seq_len,
+void vox_cuda_kv_cache_compact(vox_ctx_t *ctx, int discard, int keep, int kv_dim, int max_seq);
+void vox_cuda_kv_cache_reset(vox_ctx_t *ctx);
+void vox_cuda_kv_cache_append_block(vox_ctx_t *ctx, int layer, int start_pos, int seq_len,
                                     int kv_dim, int window_size,
                                     const float *k, const float *v);
 
@@ -85,12 +86,12 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
 /* Optional: full CUDA streaming pipeline (encoder+adapter outputs kept on
  * device, decoder consumes adapter embeddings directly). Opt-in via
  * VOX_CUDA_PIPELINE_FULL=1. */
-void vox_cuda_stream_adapter_reset(void);
+void vox_cuda_stream_adapter_reset(vox_ctx_t *ctx);
 
 /* Copy the first `n_tokens` adapter embeddings from the device-side adapter
  * buffer into `out_host` (float32, shape [n_tokens, VOX_DEC_DIM]). Used to
  * build the initial decoder prompt on CPU without copying the full adapter. */
-int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens);
+int vox_cuda_stream_adapter_copy_prompt(vox_ctx_t *ctx, float *out_host, int n_tokens);
 
 /* Discard (logically) the first `consumed_tokens` adapter embeddings from the
  * device-side adapter buffer.
@@ -98,7 +99,7 @@ int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens);
  * This is a no-copy operation in VOX_CUDA_PIPELINE_FULL mode (ring-buffer
  * semantics), and is used to avoid unbounded growth of the adapter buffer in
  * long streaming runs. */
-void vox_cuda_stream_adapter_compact(int consumed_tokens);
+void vox_cuda_stream_adapter_compact(vox_ctx_t *ctx, int consumed_tokens);
 
 /* Run CUDA full encoder+adapter and append the resulting adapter embeddings
  * to the internal device-side adapter buffer. Returns 1 on success. */
@@ -140,6 +141,7 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
 int vox_cuda_prefetch_weights(vox_ctx_t *ctx);
 
 const char *vox_cuda_device_name(void);
+void vox_cuda_ctx_free(vox_ctx_t *ctx);
 void vox_cuda_shutdown(void);
 
 #endif

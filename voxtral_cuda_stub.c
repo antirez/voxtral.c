@@ -38,7 +38,8 @@ int vox_cuda_linear2_bf16(float *y0, float *y1,
     return 0;
 }
 
-int vox_cuda_attention_step(float *attn_out,
+int vox_cuda_attention_step(vox_ctx_t *ctx,
+                            float *attn_out,
                             const float *q,
                             const float *k,
                             const float *v,
@@ -46,20 +47,25 @@ int vox_cuda_attention_step(float *attn_out,
                             int pos,
                             int total_seq,
                             int window_size) {
-    (void)attn_out; (void)q; (void)k; (void)v; (void)layer; (void)pos; (void)total_seq; (void)window_size;
+    (void)ctx; (void)attn_out; (void)q; (void)k; (void)v; (void)layer; (void)pos; (void)total_seq; (void)window_size;
     return 0;
 }
 
-void vox_cuda_kv_cache_compact(int discard, int keep, int kv_dim, int max_seq) {
-    (void)discard; (void)keep; (void)kv_dim; (void)max_seq;
+void vox_cuda_kv_cache_compact(vox_ctx_t *ctx, int discard, int keep, int kv_dim, int max_seq) {
+    (void)ctx; (void)discard; (void)keep; (void)kv_dim; (void)max_seq;
 }
 
-void vox_cuda_kv_cache_reset(void) {}
+void vox_cuda_kv_cache_reset(vox_ctx_t *ctx) { (void)ctx; }
 
-void vox_cuda_kv_cache_append_block(int layer, int start_pos, int seq_len,
+void vox_cuda_kv_cache_append_block(vox_ctx_t *ctx, int layer, int start_pos, int seq_len,
                                     int kv_dim, int window_size,
                                     const float *k, const float *v) {
-    (void)layer; (void)start_pos; (void)seq_len; (void)kv_dim; (void)window_size; (void)k; (void)v;
+    (void)ctx; (void)layer; (void)start_pos; (void)seq_len; (void)kv_dim; (void)window_size; (void)k; (void)v;
+}
+
+int vox_cuda_kv_cache_download_host(vox_ctx_t *ctx, int start_pos, int n_pos) {
+    (void)ctx; (void)start_pos; (void)n_pos;
+    return 0;
 }
 
 int vox_cuda_causal_attention(float *out,
@@ -89,15 +95,15 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
     return 0;
 }
 
-void vox_cuda_stream_adapter_reset(void) {}
+void vox_cuda_stream_adapter_reset(vox_ctx_t *ctx) { (void)ctx; }
 
-int vox_cuda_stream_adapter_copy_prompt(float *out_host, int n_tokens) {
-    (void)out_host; (void)n_tokens;
+int vox_cuda_stream_adapter_copy_prompt(vox_ctx_t *ctx, float *out_host, int n_tokens) {
+    (void)ctx; (void)out_host; (void)n_tokens;
     return 0;
 }
 
-void vox_cuda_stream_adapter_compact(int consumed_tokens) {
-    (void)consumed_tokens;
+void vox_cuda_stream_adapter_compact(vox_ctx_t *ctx, int consumed_tokens) {
+    (void)ctx; (void)consumed_tokens;
 }
 
 int vox_cuda_encode_adapter_stream_append(int *out_tokens,
@@ -139,5 +145,7 @@ int vox_cuda_prefetch_weights(vox_ctx_t *ctx) {
 }
 
 void vox_cuda_shutdown(void) {}
+
+void vox_cuda_ctx_free(vox_ctx_t *ctx) { (void)ctx; }
 
 #endif /* !USE_CUDA */

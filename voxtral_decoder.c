@@ -240,7 +240,7 @@ static void kv_cache_compact(vox_ctx_t *ctx) {
     }
 
 #ifdef USE_CUDA
-    vox_cuda_kv_cache_compact(discard, keep, kv_dim, ctx->kv_cache_max);
+    vox_cuda_kv_cache_compact(ctx, discard, keep, kv_dim, ctx->kv_cache_max);
 #endif
 
     ctx->kv_cache_host_valid_len = new_valid;
@@ -361,7 +361,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         }
 #ifdef USE_CUDA
         /* Keep device-side KV cache in sync for the upcoming single-token decode loop. */
-        vox_cuda_kv_cache_append_block(layer, start_pos, seq_len, kv_dim, VOX_DEC_WINDOW, k, v);
+        vox_cuda_kv_cache_append_block(ctx, layer, start_pos, seq_len, kv_dim, VOX_DEC_WINDOW, k, v);
 #endif
 
         /* Causal attention over full cached sequence */
@@ -560,7 +560,7 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         float *full_v = kv_cache_v_at(ctx, layer, 0);
 
 #ifdef USE_CUDA
-        if (!vox_cuda_attention_step(attn_out, q, k, v, layer, pos, total_seq, VOX_DEC_WINDOW))
+        if (!vox_cuda_attention_step(ctx, attn_out, q, k, v, layer, pos, total_seq, VOX_DEC_WINDOW))
 #endif
         {
             vox_causal_attention(attn_out, q, full_k, full_v,

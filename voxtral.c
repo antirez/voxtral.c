@@ -286,6 +286,10 @@ vox_ctx_t *vox_load(const char *model_dir) {
 void vox_free(vox_ctx_t *ctx) {
     if (!ctx) return;
 
+#ifdef USE_CUDA
+    vox_cuda_ctx_free(ctx);
+#endif
+
     /* Free f32 weights that were converted/copied from safetensors. */
     #define FREE0(p) do { free(p); (p) = NULL; } while (0)
 
@@ -468,7 +472,6 @@ struct vox_stream {
 
     /* Stream lifecycle flags */
     int init_ok;        /* used to suppress stats printing for failed init */
-    int cuda_pipeline_full_lock_held; /* VOX_CUDA_PIPELINE_FULL is global+not thread-safe */
 
     /* Pending token queue (circular buffer, VOX_MAX_ALT strings per position) */
     const char **token_queue;   /* [queue_cap * VOX_MAX_ALT] */
@@ -495,34 +498,6 @@ struct vox_stream {
     int n_generated;
     int n_text_tokens;          /* tokens with ID >= 1000 (visible text) */
 };
-
-#ifdef USE_CUDA
-/* VOX_CUDA_PIPELINE_FULL uses a global device-side adapter buffer, so it isn't
- * safe to run concurrently across multiple streams. Enforce single-stream use. */
-#ifdef _WIN32
-static volatile long g_cuda_pipeline_full_in_use = 0;
-#else
-static int g_cuda_pipeline_full_in_use = 0;
-#endif
-
-static int cuda_pipeline_full_acquire(void) {
-#ifdef _WIN32
-    return InterlockedCompareExchange(&g_cuda_pipeline_full_in_use, 1, 0) == 0;
-#else
-    int expected = 0;
-    return __atomic_compare_exchange_n(&g_cuda_pipeline_full_in_use, &expected, 1, 0,
-                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-#endif
-}
-
-static void cuda_pipeline_full_release(void) {
-#ifdef _WIN32
-    InterlockedExchange(&g_cuda_pipeline_full_in_use, 0);
-#else
-    __atomic_store_n(&g_cuda_pipeline_full_in_use, 0, __ATOMIC_SEQ_CST);
-#endif
-}
-#endif
 
 /* Enqueue one token position. alts[0]=best, alts[1..VOX_MAX_ALT-1]=alternatives or NULL. */
 static void stream_enqueue_token(vox_stream_t *s, const char *alts[VOX_MAX_ALT]) {
@@ -771,14 +746,14 @@ static void stream_adapter_compact(vox_stream_t *s) {
     if (consumed <= 0) return;
 
 #ifdef USE_CUDA
-    if (!s->adapter_buf) {
-        /* VOX_CUDA_PIPELINE_FULL keeps the adapter on-device. */
-        if (stream_use_cuda_pipeline_full()) {
-            vox_cuda_stream_adapter_compact(consumed);
-            s->adapter_pos_offset += consumed;
-        }
-        return;
-    }
+	    if (!s->adapter_buf) {
+	        /* VOX_CUDA_PIPELINE_FULL keeps the adapter on-device. */
+	        if (stream_use_cuda_pipeline_full()) {
+	            vox_cuda_stream_adapter_compact(s->ctx, consumed);
+	            s->adapter_pos_offset += consumed;
+	        }
+	        return;
+	    }
 #else
     if (!s->adapter_buf) return;
 #endif
@@ -858,7 +833,7 @@ static void stream_run_encoder(vox_stream_t *s) {
                 s->adapter_pos_offset = 0;
 #ifdef USE_CUDA
                 if (stream_use_cuda_pipeline_full()) {
-                    vox_cuda_stream_adapter_reset();
+                    vox_cuda_stream_adapter_reset(s->ctx);
                 }
 #endif
             } else {
@@ -1128,12 +1103,12 @@ static void stream_run_decoder(vox_stream_t *s) {
         float *prompt_embeds = (float *)malloc((size_t)prompt_len * dim * sizeof(float));
         if (!prompt_embeds) return;
 
-        if (stream_use_cuda_pipeline_full()) {
+	        if (stream_use_cuda_pipeline_full()) {
 #ifdef USE_CUDA
-            if (!vox_cuda_stream_adapter_copy_prompt(prompt_embeds, prompt_len)) {
-                free(prompt_embeds);
-                return;
-            }
+	            if (!vox_cuda_stream_adapter_copy_prompt(s->ctx, prompt_embeds, prompt_len)) {
+	                free(prompt_embeds);
+	                return;
+	            }
 #else
             free(prompt_embeds);
             return;
@@ -1158,7 +1133,7 @@ static void stream_run_decoder(vox_stream_t *s) {
         s->ctx->kv_cache_host_valid_len = 0;
         s->ctx->kv_pos_offset = 0;
 #ifdef USE_CUDA
-        vox_cuda_kv_cache_reset();
+        vox_cuda_kv_cache_reset(s->ctx);
 #endif
         /* Keep KV cache allocated — vox_decoder_prefill will reuse or grow it. */
 
@@ -1259,18 +1234,8 @@ vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
     s->ctx = ctx;
 
 #ifdef USE_CUDA
-    /* Full CUDA pipeline uses a global device-side adapter buffer and is not
-     * thread-safe across multiple concurrent streams. */
     if (stream_use_cuda_pipeline_full()) {
-        if (!cuda_pipeline_full_acquire()) {
-            fprintf(stderr,
-                    "Error: VOX_CUDA_PIPELINE_FULL=1 is single-stream only (global adapter buffer). "
-                    "Disable it or serialize streams.\n");
-            vox_stream_free(s);
-            return NULL;
-        }
-        s->cuda_pipeline_full_lock_held = 1;
-        vox_cuda_stream_adapter_reset();
+        vox_cuda_stream_adapter_reset(ctx);
     }
 #endif
 
@@ -1418,11 +1383,8 @@ void vox_stream_free(vox_stream_t *s) {
     }
 
 #ifdef USE_CUDA
-    /* VOX_CUDA_PIPELINE_FULL uses a global device-side adapter buffer. */
-    if (s->cuda_pipeline_full_lock_held) {
-        vox_cuda_stream_adapter_reset();
-        cuda_pipeline_full_release();
-        s->cuda_pipeline_full_lock_held = 0;
+    if (stream_use_cuda_pipeline_full()) {
+        vox_cuda_stream_adapter_reset(s->ctx);
     }
 #endif
 

@@ -223,10 +223,11 @@ This keeps streaming adapter embeddings on-device and lets CUDA build the per-st
 - Avoids uploading a new step embedding (`HtoD`) every generated token.
 
 Notes:
-- Experimental and currently **not thread-safe** (uses a global device-side adapter buffer).
+- Experimental. Thread-safe across multiple `vox_ctx_t` instances (CUDA backend serializes calls via a global lock).
 - If it fails mid-run, we currently fail-fast rather than attempting a CPU fallback.
 - Prompt prefill still copies only the first prompt window from device to host to reuse the existing prefill path.
 - In pipeline mode, GPU conv stem is attempted by default unless disabled (`VOX_DISABLE_CUDA_CONV_STEM=1`).
+- Concurrency smoke test: `./scripts/stress_cuda_two_streams.sh voxtral-model samples/test_speech.wav`
 
 Related env vars:
 - `VOX_DISABLE_CUDA_PIPELINE_FULL=1` disables the pipeline.
