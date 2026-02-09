@@ -11,6 +11,26 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* Windows/POSIX Portability */
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
+#include <direct.h>
+#define strdup _strdup
+#else
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
+/* Cross-platform time in milliseconds (monotonic-ish). */
+double vox_get_time_ms(void);
+
 /* ========================================================================
  * Model Constants
  * ======================================================================== */
@@ -164,6 +184,7 @@ typedef struct {
     float *kv_cache_k;       /* [layers, max_seq, kv_heads * head_dim] */
     float *kv_cache_v;       /* [layers, max_seq, kv_heads * head_dim] */
     int kv_cache_len;        /* Current physical cache length */
+    int kv_cache_host_valid_len; /* Host KV cache prefix that is valid. CUDA-full keeps KV on-device and may leave host stale. */
     int kv_cache_max;        /* Maximum cache size */
     int kv_pos_offset;       /* Logical position offset (positions discarded by compaction) */
 
@@ -198,6 +219,7 @@ typedef struct {
     float *dec_attn_out, *dec_proj_out;
     float *dec_gate, *dec_up, *dec_ffn_out;
     float *dec_rope_freqs;
+    float *dec_logits; /* Optional: only used if caller passes logits=NULL */
 } vox_ctx_t;
 
 /* ========================================================================

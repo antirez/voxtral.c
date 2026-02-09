@@ -2,6 +2,7 @@
  * voxtral_mic.h - Microphone capture API
  *
  * macOS implementation uses AudioQueue Services (AudioToolbox).
+ * Windows implementation uses WASAPI.
  * Other platforms: stubs that return errors.
  */
 

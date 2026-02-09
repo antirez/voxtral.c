@@ -4,13 +4,23 @@
  */
 
 #include "voxtral_safetensors.h"
+#include "voxtral.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <io.h>
+#else
 #include <unistd.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
+#endif
 
 /* Minimal JSON parser for safetensors header */
 
@@ -208,8 +218,13 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_fstat64(fd, &st) < 0) {
+#else
     struct stat st;
     if (fstat(fd, &st) < 0) {
+#endif
         perror("safetensors_open: fstat failed");
         close(fd);
         return NULL;
@@ -222,13 +237,27 @@ safetensors_file_t *safetensors_open(const char *path) {
         return NULL;
     }
 
-    void *data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *data = NULL;
+#ifdef _WIN32
+    HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+    HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (hMap) {
+        data = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(hMap);
+    }
     close(fd);
-
+    if (!data) {
+        fprintf(stderr, "safetensors_open: MapViewOfFile failed (error %lu)\n", GetLastError());
+        return NULL;
+    }
+#else
+    data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
     if (data == MAP_FAILED) {
         perror("safetensors_open: mmap failed");
         return NULL;
     }
+#endif
 
     /* Read header size (8-byte little-endian) */
     uint64_t header_size = 0;
@@ -236,13 +265,21 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (header_size > file_size - 8) {
         fprintf(stderr, "safetensors_open: invalid header size\n");
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+#else
         munmap(data, file_size);
+#endif
         return NULL;
     }
 
     safetensors_file_t *sf = calloc(1, sizeof(safetensors_file_t));
     if (!sf) {
+#ifdef _WIN32
+        UnmapViewOfFile(data);
+#else
         munmap(data, file_size);
+#endif
         return NULL;
     }
 
@@ -285,7 +322,13 @@ safetensors_file_t *safetensors_open(const char *path) {
 
 void safetensors_close(safetensors_file_t *sf) {
     if (!sf) return;
-    if (sf->data) munmap(sf->data, sf->file_size);
+    if (sf->data) {
+#ifdef _WIN32
+        UnmapViewOfFile(sf->data);
+#else
+        munmap(sf->data, sf->file_size);
+#endif
+    }
     free(sf->path);
     free(sf->header_json);
     free(sf);

@@ -18,6 +18,7 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 # Build (choose your backend)
 make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
+# or: make cuda    # NVIDIA CUDA/cuBLAS (Linux/WSL2)
 
 # Download the model (~8.9GB)
 ./download_model.sh
@@ -131,6 +132,12 @@ If the model falls behind real-time, a warning is printed and audio is skipped t
 
 `--from-mic`, `--stdin`, and `-i` are mutually exclusive.
 
+If you are piping raw PCM and want to reduce overhead (process in larger chunks), you can set:
+
+```bash
+VOX_STDIN_INTERVAL_SEC=2 ./voxtral -d voxtral-model --stdin
+```
+
 To convert files to WAV format, just use `ffmpeg`:
 
     ffmpeg -i input.ogg output.wav
@@ -243,13 +250,15 @@ Choose a backend when building:
 ```bash
 make            # Show available backends
 make blas       # BLAS acceleration (Accelerate on macOS, OpenBLAS on Linux)
+make cuda       # NVIDIA CUDA/cuBLAS acceleration (Linux/WSL2)
 make mps        # Apple Silicon Metal GPU (fastest, macOS only)
 ```
 
 **Recommended:**
 - macOS Apple Silicon: `make mps`
 - macOS Intel: `make blas`
-- Linux with OpenBLAS: `make blas`
+- Linux with NVIDIA GPU (including WSL2): `make cuda`
+- Linux CPU-only / OpenBLAS: `make blas`
 
 For `make blas` on Linux, install OpenBLAS first:
 ```bash
@@ -333,3 +342,115 @@ WAV → 16kHz → Mel Spectrogram → Conv Stem → Encoder → Downsample 4x �
 ## License
 
 MIT
+
+## CUDA on Windows 11 + WSL2 (Ubuntu)
+
+This repository now includes a CUDA backend that uses **cuBLAS** for large matrix multiplies (`make cuda`).
+The CUDA backend uses the CUDA **driver API** (`libcuda`) and does not require linking against `libcudart`.
+
+### Prerequisites
+
+1. Install the latest NVIDIA Windows driver with WSL CUDA support.
+2. Install WSL2 + Ubuntu 22.04+.
+3. Inside Ubuntu, install the CUDA toolkit (includes `nvcc`, `cublas`, and runtime libraries).
+
+### Build
+
+```bash
+make cuda
+# or if CUDA toolkit is installed elsewhere:
+make cuda CUDA_HOME=/usr/local/cuda
+```
+
+The build now performs a preflight check for `cuda.h` + `cublas_v2.h` under `${CUDA_HOME}/include`.
+
+Optional (Linux): enable OpenMP for faster CPU-side kernels:
+
+```bash
+make cuda OPENMP=1
+```
+
+### Verify CUDA visibility in WSL2
+
+```bash
+nvidia-smi
+```
+
+If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will offload large GEMMs to the GPU.
+
+
+### Recommended WSL2 versions (known-good baseline)
+
+- Windows 11 with recent NVIDIA Game Ready or Studio driver that includes WSL CUDA support.
+- Ubuntu 22.04+ in WSL2.
+- CUDA toolkit in Ubuntu (`cuda.h`, `libcublas`).
+
+### Troubleshooting
+
+- `cuda.h not found`: install CUDA toolkit in Ubuntu and/or set `CUDA_HOME`.
+- `error while loading shared libraries: libcublas.so`: ensure `${CUDA_HOME}/lib64` is in linker path (or build with correct `CUDA_HOME`).
+- `nvidia-smi` fails in WSL2: update Windows NVIDIA driver and verify WSL GPU support is enabled.
+- OOM during long runs: reduce concurrent workloads and close GPU-intensive apps on host Windows.
+
+### Validation and benchmark helpers
+
+```bash
+# Build + optional smoke test
+./scripts/validate_cuda.sh voxtral-model samples/test_speech.wav
+
+# Compare BLAS vs CUDA timing + output files
+./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+```
+
+Fast CUDA config (best-effort, can be overridden by per-feature env vars):
+
+```bash
+VOX_CUDA_FAST=1 ./voxtral -d voxtral-model -i samples/test_speech.wav
+```
+
+Notes:
+- `VOX_CUDA_FAST=1` enables a fused top1-only logits path by default when alternatives are disabled (`--alt` not used). Disable it with `VOX_DISABLE_CUDA_LOGITS_FUSED=1` if you want to benchmark the baseline logits+argmax path.
+- `VOX_CUDA_FAST=1` also enables the chunked attention v4 path by default (fused KV append into the v3 partial kernel, best-effort). Disable it with `VOX_DISABLE_CUDA_ATTN_V4=1`.
+- `VOX_CUDA_ATTN_V5=1` enables an experimental decoder attention variant that skips inactive chunks (best-effort; default off until validated broadly).
+- `VOX_CUDA_FAST=1` also enables cuBLASLt autotune for the `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_AUTOTUNE=1`.
+- `VOX_CUDA_FAST=1` also enables a cuBLASLt “transpose-B view” for `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_TRANSPOSE_B=1` (or force it with `VOX_CUDA_CUBLASLT_TRANSPOSE_B=0/1`).
+- `VOX_CUDA_LT_COMPUTE=32F_FAST_16BF` (or similar) opts into alternate cuBLASLt compute modes for BF16 GEMMs (default: `32F`). This may change outputs slightly; use `./scripts/accuracy_regression.sh` to validate.
+
+To run the extra CUDA benchmark variants (graphs/v3/merged/etc):
+
+```bash
+VOX_BENCH_CUDA_OPTS=1 ./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+```
+
+
+### Driver / Toolkit matrix (known-good starting point)
+
+| Layer | Recommended |
+|---|---|
+| Windows host | Windows 11 23H2+ |
+| NVIDIA driver | R550+ with WSL CUDA support |
+| WSL | WSL2 (`wsl --update`) |
+| Ubuntu guest | 22.04 LTS or 24.04 LTS |
+| CUDA toolkit in Ubuntu | 12.4+ |
+| GPU class tested target | RTX 3080 Ti |
+
+### Real-time microphone pipeline recipe (WSL2)
+
+```bash
+# Windows host: capture mic with ffmpeg (or equivalent) and pipe raw PCM into WSL voxtral
+# Example run *inside* WSL when mic source is exposed by ffmpeg:
+ffmpeg -f pulse -i default -f s16le -ar 16000 -ac 1 - 2>/dev/null |   ./voxtral -d voxtral-model --stdin
+```
+
+If `pulse` is unavailable in your WSL distribution, use a host-side capture path and stream PCM into WSL over stdin or TCP.
+
+### Accuracy regression helper
+
+```bash
+# Compares BLAS vs CUDA transcripts with token mismatch tolerance (default: 0.5%)
+./scripts/accuracy_regression.sh voxtral-model samples/test_speech.wav 0.005
+```
+
+### CUDA / WSL2 Notes
+
+For detailed bringup, benchmark results, and profiling notes, see `PR_NOTES_CUDA_WSL2.md`.
