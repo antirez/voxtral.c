@@ -82,6 +82,7 @@ static CUfunction g_fn_expand_kv_heads = 0;
 static CUfunction g_fn_softmax = 0;
 static CUfunction g_fn_rms_norm = 0;
 static CUfunction g_fn_rms_norm_to_bf16 = 0;
+static CUfunction g_fn_rms_norm_to_bf16_ada = 0;
 static CUfunction g_fn_add_bias = 0;
 static CUfunction g_fn_add_inplace = 0;
 static CUfunction g_fn_mul_inplace = 0;
@@ -131,6 +132,24 @@ static size_t g_hostregs_bytes = 0;
 /* cuBLASLt workspace + algo cache (used primarily for M=1 matmuls). */
 static CUdeviceptr g_lt_workspace = 0;
 static size_t g_lt_workspace_cap = 0;
+
+static size_t cublaslt_max_workspace_bytes(void) {
+    /* This affects algo selection for M=1 matmuls. Bigger workspaces can unlock
+     * faster kernels at the cost of some persistent VRAM. */
+    static size_t cached = (size_t)-1;
+    if (cached != (size_t)-1) return cached;
+    long mb = 32; /* default */
+    const char *env = getenv("VOX_CUDA_CUBLASLT_MAX_WS_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env) mb = v;
+    }
+    if (mb < 0) mb = 0;
+    if (mb > 2048) mb = 2048; /* clamp */
+    cached = (size_t)mb * 1024ULL * 1024ULL;
+    return cached;
+}
 
 typedef struct {
     int M, K, N;
@@ -1124,6 +1143,8 @@ static int cuda_load_kernel_module(void) {
         if (g_mod) {
             if (!g_fn_rms_norm_to_bf16)
                 (void)cuModuleGetFunction(&g_fn_rms_norm_to_bf16, g_mod, "vox_rms_norm_to_bf16");
+            if (!g_fn_rms_norm_to_bf16_ada)
+                (void)cuModuleGetFunction(&g_fn_rms_norm_to_bf16_ada, g_mod, "vox_rms_norm_to_bf16_ada");
             if (!g_fn_mul_1p_rows_inplace)
                 (void)cuModuleGetFunction(&g_fn_mul_1p_rows_inplace, g_mod, "vox_mul_1p_rows_inplace_f32");
             if (!g_fn_silu_mul)
@@ -1226,6 +1247,7 @@ static int cuda_load_kernel_module(void) {
     r = cuModuleGetFunction(&g_fn_rms_norm, g_mod, "vox_rms_norm_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_rms_norm_f32)", r); return 0; }
     (void)cuModuleGetFunction(&g_fn_rms_norm_to_bf16, g_mod, "vox_rms_norm_to_bf16");
+    (void)cuModuleGetFunction(&g_fn_rms_norm_to_bf16_ada, g_mod, "vox_rms_norm_to_bf16_ada");
     r = cuModuleGetFunction(&g_fn_add_bias, g_mod, "vox_add_bias_f32");
     if (r != CUDA_SUCCESS) { log_cu_error("cuModuleGetFunction(vox_add_bias_f32)", r); return 0; }
     r = cuModuleGetFunction(&g_fn_add_inplace, g_mod, "vox_add_inplace_f32");
@@ -1412,6 +1434,31 @@ static int launch_rms_norm_to_bf16(CUdeviceptr out_bf16,
                                 0, g_stream,
                                 params, NULL);
     if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(rms_norm_to_bf16)", r); return 0; }
+    return 1;
+}
+
+static int launch_rms_norm_to_bf16_ada(CUdeviceptr out_bf16,
+                                       CUdeviceptr x,
+                                       CUdeviceptr weight,
+                                       CUdeviceptr ada,
+                                       int rows,
+                                       int hidden,
+                                       float eps) {
+    if (!out_bf16 || !x || !weight || !ada) return 0;
+    if (rows <= 0 || hidden <= 0) return 0;
+    if (!cuda_load_kernel_module()) return 0;
+    const char *disable = getenv("VOX_DISABLE_CUDA_RMSNORM_BF16_FUSED");
+    if (disable && disable[0] && disable[0] != '0') return 0;
+    if (!g_fn_rms_norm_to_bf16_ada) return 0;
+
+    int threads = 256;
+    void *params[] = { &out_bf16, &x, &weight, &ada, &rows, &hidden, &eps };
+    CUresult r = cuLaunchKernel(g_fn_rms_norm_to_bf16_ada,
+                                rows, 1, 1,
+                                threads, 1, 1,
+                                0, g_stream,
+                                params, NULL);
+    if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(rms_norm_to_bf16_ada)", r); return 0; }
     return 1;
 }
 
@@ -1908,7 +1955,7 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
     st = cublasLtMatmulPreferenceCreate(&pref);
     if (st != CUBLAS_STATUS_SUCCESS) goto fail;
 
-    size_t max_ws = (size_t)32 * 1024 * 1024;
+    size_t max_ws = cublaslt_max_workspace_bytes();
     (void)cublasLtMatmulPreferenceSetAttribute(pref,
                                                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                                &max_ws, sizeof(max_ws));
@@ -2735,6 +2782,7 @@ void vox_cuda_shutdown(void) {
     g_fn_softmax = 0;
     g_fn_rms_norm = 0;
     g_fn_rms_norm_to_bf16 = 0;
+    g_fn_rms_norm_to_bf16_ada = 0;
     g_fn_add_bias = 0;
     g_fn_add_inplace = 0;
     g_fn_mul_inplace = 0;
@@ -4474,11 +4522,16 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int use_lo
         }
 
         /* FFN */
-        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
-        if (dAda[layer]) {
-            if (!launch_mul_1p_inplace(g_dec_x_norm, dAda[layer], dim)) goto capture_fail;
+        if (dAda[layer] && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm[layer], dAda[layer],
+                                                       1, dim, VOX_DEC_NORM_EPS)) {
+            /* Fused ffn-norm + ada + bf16 cast. */
+        } else {
+            if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
+            if (dAda[layer]) {
+                if (!launch_mul_1p_inplace(g_dec_x_norm, dAda[layer], dim)) goto capture_fail;
+            }
+            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
         }
-        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
 
         CUdeviceptr dGate = g_dec_gate;
         if (use_merge_ffn13) {
@@ -4805,15 +4858,21 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
         }
 
         /* FFN */
-        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
+        CUdeviceptr d_ada = 0;
         if (ctx->ada_scale) {
             const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
-            CUdeviceptr d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
+            d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
             if (!d_ada) return 0;
-            if (!launch_mul_1p_inplace(g_dec_x_norm, d_ada, dim)) return 0;
         }
-
-        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
+        if (d_ada && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm, d_ada, 1, dim, VOX_DEC_NORM_EPS)) {
+            /* Fused ffn-norm + ada + bf16 cast. */
+        } else {
+            if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
+            if (d_ada) {
+                if (!launch_mul_1p_inplace(g_dec_x_norm, d_ada, dim)) return 0;
+            }
+            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
+        }
 
         size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
         CUdeviceptr dGate = g_dec_gate;
@@ -5115,22 +5174,27 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
         }
 
         /* ---- FFN ---- */
-        if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
-
+        CUdeviceptr d_ada = 0;
         if (ctx->ada_scale) {
             const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
-            CUdeviceptr d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
+            d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
             if (!d_ada) return 0;
-            if (!launch_mul_1p_rows_inplace(g_dec_x_norm, d_ada, seq_len, dim)) {
-                /* Fallback: per-row kernel launch. */
-                for (int s = 0; s < seq_len; s++) {
-                    CUdeviceptr row = g_dec_x_norm + (size_t)s * (size_t)dim * sizeof(float);
-                    if (!launch_mul_1p_inplace(row, d_ada, dim)) return 0;
+        }
+        if (d_ada && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm, d_ada, seq_len, dim, VOX_DEC_NORM_EPS)) {
+            /* Fused ffn-norm + ada + bf16 cast. */
+        } else {
+            if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
+            if (d_ada) {
+                if (!launch_mul_1p_rows_inplace(g_dec_x_norm, d_ada, seq_len, dim)) {
+                    /* Fallback: per-row kernel launch. */
+                    for (int s = 0; s < seq_len; s++) {
+                        CUdeviceptr row = g_dec_x_norm + (size_t)s * (size_t)dim * sizeof(float);
+                        if (!launch_mul_1p_inplace(row, d_ada, dim)) return 0;
+                    }
                 }
             }
+            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
         }
-
-        if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
 
         size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
         CUdeviceptr dW1 = 0, dW3 = 0;
