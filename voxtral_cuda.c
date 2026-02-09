@@ -32,6 +32,9 @@
 static void log_cu_error(const char *what, CUresult r);
 static int pipeline_full_enabled(void);
 
+/* voxtral.c global verbosity flag */
+extern int vox_verbose;
+
 static cublasHandle_t g_handle;
 static cublasLtHandle_t g_lt_handle;
 static CUcontext g_ctx;
@@ -161,6 +164,7 @@ static size_t cublaslt_max_workspace_bytes(void) {
 typedef struct {
     int M, K, N;
     int layout_kind; /* 0=legacy row-major layouts, 1=transpose-B view (col-major B=KxN) */
+    int compute_type; /* cublasComputeType_t (cast to int) */
     cublasLtMatmulAlgo_t algo;
     cublasLtMatmulDesc_t op;
     cublasLtMatrixLayout_t a;
@@ -370,6 +374,51 @@ static int cublaslt_autotune_iters(int N) {
         if (iters > 10) iters = 10;
     }
     return iters;
+}
+
+static int eq_nocase(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static cublasComputeType_t cublaslt_compute_type_bf16(void) {
+    /* Opt-in: allow alternate compute modes for Lt BF16 GEMMs.
+     * Default: CUBLAS_COMPUTE_32F (FP32 accumulate). */
+    static int cached = 0;
+    static cublasComputeType_t cached_type = CUBLAS_COMPUTE_32F;
+    if (cached) return cached_type;
+
+    const char *env = getenv("VOX_CUDA_LT_COMPUTE");
+    if (!env || !env[0] || env[0] == '0') { cached = 1; return cached_type; }
+
+    if (eq_nocase(env, "32F")) {
+        cached_type = CUBLAS_COMPUTE_32F;
+    } else if (eq_nocase(env, "32F_FAST_16BF")) {
+        cached_type = CUBLAS_COMPUTE_32F_FAST_16BF;
+    } else if (eq_nocase(env, "32F_FAST_TF32")) {
+        cached_type = CUBLAS_COMPUTE_32F_FAST_TF32;
+    } else if (eq_nocase(env, "32F_FAST_16F")) {
+        cached_type = CUBLAS_COMPUTE_32F_FAST_16F;
+    } else {
+        if (vox_verbose >= 1) {
+            fprintf(stderr, "[cuda] warning: unknown VOX_CUDA_LT_COMPUTE='%s' (using 32F)\n", env);
+        }
+        cached_type = CUBLAS_COMPUTE_32F;
+    }
+
+    if (vox_verbose >= 1 && cached_type != CUBLAS_COMPUTE_32F) {
+        fprintf(stderr, "[cuda] cuBLASLt computeType override: %s\n", env);
+    }
+
+    cached = 1;
+    return cached_type;
 }
 
 static int merge_qkv_enabled(void) {
@@ -956,9 +1005,6 @@ static uint16_t *host_a_bf16_get(size_t n) {
     }
     return g_host_a_bf16;
 }
-
-/* voxtral.c global verbosity flag */
-extern int vox_verbose;
 
 /* Filled in by Makefile for CUDA builds (e.g. -DVOX_CUDA_ARCH=sm_86). */
 #ifndef VOX_CUDA_ARCH
@@ -2012,13 +2058,14 @@ static int ensure_lt_workspace(size_t needed_bytes) {
     return ensure_buffer(&g_lt_workspace, &g_lt_workspace_cap, needed_bytes);
 }
 
-static lt_algo_entry_t *lt_cache_find(int M, int K, int N, int layout_kind) {
+static lt_algo_entry_t *lt_cache_find(int M, int K, int N, int layout_kind, cublasComputeType_t compute_type) {
     for (int i = 0; i < g_lt_algos_len; i++) {
         if (g_lt_algos[i].valid &&
             g_lt_algos[i].M == M &&
             g_lt_algos[i].K == K &&
             g_lt_algos[i].N == N &&
-            g_lt_algos[i].layout_kind == layout_kind) {
+            g_lt_algos[i].layout_kind == layout_kind &&
+            g_lt_algos[i].compute_type == (int)compute_type) {
             return &g_lt_algos[i];
         }
     }
@@ -2044,14 +2091,15 @@ static int lt_autotune_t_bf16(int M, int K, int N,
 
     /* Ensure we have a cache entry (op/layouts). */
     int layout_kind = cublaslt_transpose_b_enabled() ? 1 : 0;
-    lt_algo_entry_t *e = lt_cache_find(M, K, N, layout_kind);
+    cublasComputeType_t compute_type = cublaslt_compute_type_bf16();
+    lt_algo_entry_t *e = lt_cache_find(M, K, N, layout_kind, compute_type);
     if (!e) {
         cublasLtMatmulAlgo_t tmp_algo;
         size_t tmp_ws = 0;
         if (!lt_get_algo_t_bf16(M, K, N, &tmp_algo, &tmp_ws, NULL, NULL, NULL, NULL)) {
             return 1;
         }
-        e = lt_cache_find(M, K, N, layout_kind);
+        e = lt_cache_find(M, K, N, layout_kind, compute_type);
         if (!e) return 1;
     }
 
@@ -2195,12 +2243,14 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
     if (!g_lt_handle) return 0;
 
     int layout_kind = cublaslt_transpose_b_enabled() ? 1 : 0;
+    cublasComputeType_t compute_type = cublaslt_compute_type_bf16();
     for (int i = 0; i < g_lt_algos_len; i++) {
         if (g_lt_algos[i].valid &&
             g_lt_algos[i].M == M &&
             g_lt_algos[i].K == K &&
             g_lt_algos[i].N == N &&
-            g_lt_algos[i].layout_kind == layout_kind) {
+            g_lt_algos[i].layout_kind == layout_kind &&
+            g_lt_algos[i].compute_type == (int)compute_type) {
             *out_algo = g_lt_algos[i].algo;
             *out_ws = g_lt_algos[i].workspace_bytes;
             if (out_op) *out_op = g_lt_algos[i].op;
@@ -2218,7 +2268,7 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
     int returned = 0;
 
     cublasStatus_t st;
-    st = cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    st = cublasLtMatmulDescCreate(&op, compute_type, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) goto fail;
 
     if (layout_kind == 1) {
@@ -2287,6 +2337,7 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
         g_lt_algos[g_lt_algos_len++] = (lt_algo_entry_t){
             .M = M, .K = K, .N = N,
             .layout_kind = layout_kind,
+            .compute_type = (int)compute_type,
             .algo = heur.algo,
             .op = op,
             .a = a,
