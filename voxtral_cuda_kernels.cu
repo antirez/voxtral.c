@@ -14,6 +14,13 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
     return x;
 }
 
+static __device__ __forceinline__ int warp_reduce_sum_i32(int x) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_down_sync(0xffffffff, x, offset);
+    }
+    return x;
+}
+
 /* Reduce across up to 8 warps (256 threads). Assumes blockDim.x is a multiple of 32. */
 static __device__ __forceinline__ float block_reduce_sum_256(float x, float *shmem) {
     int lane = threadIdx.x & 31;
@@ -2636,9 +2643,9 @@ extern "C" __global__ void vox_logits_best_bf16_top1(unsigned long long *best_pa
     if (base >= vocab) return;
 
     /* Dynamic shared: x_bf16[dim]. Align to enable vectorized loads. */
-    extern __shared__ __align__(16) uint16_t shx[];
+    extern __shared__ __align__(16) uint16_t shx_bf16[];
     for (int i = tid; i < dim; i += (int)blockDim.x) {
-        shx[i] = x_bf16[i];
+        shx_bf16[i] = x_bf16[i];
     }
     __syncthreads();
 
@@ -2647,7 +2654,7 @@ extern "C" __global__ void vox_logits_best_bf16_top1(unsigned long long *best_pa
 
     /* Assign rows interleaved by warp for coalescing. Vectorize the inner loop by
      * loading 2 BF16 values at a time (uint32), halving loop iterations. */
-    const uint4 *x4 = (const uint4 *)shx;
+    const uint4 *x4 = (const uint4 *)shx_bf16;
     int vec4 = dim >> 3; /* BF16 groups of 8 */
     int can_vec4 = ((dim & 7) == 0);
 
@@ -2697,7 +2704,7 @@ extern "C" __global__ void vox_logits_best_bf16_top1(unsigned long long *best_pa
             }
         } else {
             for (int k = lane; k < dim; k += 32) {
-                float a = vox_bf16_to_f32(shx[k]);
+                float a = vox_bf16_to_f32(shx_bf16[k]);
                 float b = vox_bf16_to_f32(w[k]);
                 sum = fmaf(a, b, sum);
             }
@@ -2734,6 +2741,123 @@ extern "C" __global__ void vox_logits_best_bf16_top1(unsigned long long *best_pa
 
         uint32_t ord = vox_f32_to_ordered_u32(best);
         /* Low bits are ~idx so ties prefer smaller idx under atomicMax. */
+        unsigned long long packed = ((unsigned long long)ord << 32) | (unsigned long long)(~(uint32_t)best_idx);
+        (void)atomicMax(best_packed, packed);
+    }
+}
+
+extern "C" __global__ void vox_f32_vec_to_i8(int8_t *out_i8,
+                                            const float *in_f32,
+                                            int n) {
+    if (!out_i8 || !in_f32 || n <= 0) return;
+
+    __shared__ float sh_warp[8];
+    __shared__ float sh_max;
+
+    float tmax = 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        float v = fabsf(in_f32[i]);
+        tmax = (v > tmax) ? v : tmax;
+    }
+    float maxabs = block_reduce_max(tmax, sh_warp);
+    if (threadIdx.x == 0) sh_max = maxabs;
+    __syncthreads();
+
+    float inv = (sh_max > 0.0f) ? (127.0f / sh_max) : 0.0f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        int q = __float2int_rn(in_f32[i] * inv);
+        q = (q > 127) ? 127 : q;
+        q = (q < -127) ? -127 : q;
+        out_i8[i] = (int8_t)q;
+    }
+}
+
+extern "C" __global__ void vox_logits_best_i8_top1(unsigned long long *best_packed,
+                                                   const int8_t *x_i8,
+                                                   const int8_t *tok_i8,
+                                                   const float *tok_scales,
+                                                   int dim,
+                                                   int vocab) {
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 4;
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP; /* 32 */
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= vocab) return;
+
+    extern __shared__ __align__(16) int8_t shx_i8[];
+    for (int i = tid; i < dim; i += (int)blockDim.x) {
+        shx_i8[i] = x_i8[i];
+    }
+    __syncthreads();
+
+    float warp_best = -1.0e30f;
+    int warp_best_idx = 0;
+
+    int n4 = dim >> 2;
+    int can_vec4 = ((dim & 3) == 0);
+    const int *x4 = (const int *)shx_i8;
+
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= vocab) continue;
+
+        const int8_t *w = tok_i8 + (size_t)row * (size_t)dim;
+        int acc = 0;
+        if (can_vec4) {
+            const int *w4 = (const int *)w;
+            for (int i = lane; i < n4; i += 32) {
+#if __CUDA_ARCH__ >= 610
+                acc = __dp4a(x4[i], w4[i], acc);
+#else
+                int xa = x4[i];
+                int wa = w4[i];
+                acc += (int)(int8_t)(xa & 0xff) * (int)(int8_t)(wa & 0xff);
+                acc += (int)(int8_t)((xa >> 8) & 0xff) * (int)(int8_t)((wa >> 8) & 0xff);
+                acc += (int)(int8_t)((xa >> 16) & 0xff) * (int)(int8_t)((wa >> 16) & 0xff);
+                acc += (int)(int8_t)((xa >> 24) & 0xff) * (int)(int8_t)((wa >> 24) & 0xff);
+#endif
+            }
+        } else {
+            for (int k = lane; k < dim; k += 32) {
+                acc += (int)shx_i8[k] * (int)w[k];
+            }
+        }
+
+        acc = warp_reduce_sum_i32(acc);
+        if (lane == 0) {
+            float logit = (float)acc * tok_scales[row];
+            if (logit > warp_best || (logit == warp_best && row < warp_best_idx)) {
+                warp_best = logit;
+                warp_best_idx = row;
+            }
+        }
+    }
+
+    __shared__ float sh_best_val[WARPS];
+    __shared__ int sh_best_idx[WARPS];
+    if (lane == 0) {
+        sh_best_val[warp] = warp_best;
+        sh_best_idx[warp] = warp_best_idx;
+    }
+    __syncthreads();
+
+    if (warp == 0 && lane == 0) {
+        float best = sh_best_val[0];
+        int best_idx = sh_best_idx[0];
+        for (int w = 1; w < WARPS; w++) {
+            float v = sh_best_val[w];
+            int idx = sh_best_idx[w];
+            if (v > best || (v == best && idx < best_idx)) {
+                best = v;
+                best_idx = idx;
+            }
+        }
+
+        uint32_t ord = vox_f32_to_ordered_u32(best);
         unsigned long long packed = ((unsigned long long)ord << 32) | (unsigned long long)(~(uint32_t)best_idx);
         (void)atomicMax(best_packed, packed);
     }

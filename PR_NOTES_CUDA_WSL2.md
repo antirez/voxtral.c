@@ -39,6 +39,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - Optional device RoPE freqs generation for CUDA Graph mode (reduces CPU overhead per step; opt-in).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
   - Optional fused top1-only logits projection (enabled by `VOX_CUDA_FAST=1`): avoids materializing the full-vocab logits buffer when only the best token id is needed.
+  - Optional INT8 top1-only logits projection: `VOX_CUDA_LOGITS_INT8=1` (strict opt-in; may affect accuracy).
   - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
 
 ## Build
@@ -188,6 +189,21 @@ On `samples/antirez_speaking_italian_short.ogg` (~60s), combined with CUDA Graph
 - Graphs (no merged weights): decoder ~`13.2 ms/step`
 - Graphs + merged weights: decoder ~`12.7 ms/step`
 
+### INT8 LM Head For Top1 (opt-in, accuracy-risky)
+
+Enable with:
+
+```bash
+VOX_CUDA_LOGITS_INT8=1
+```
+
+This quantizes the tok embeddings / LM head weights to INT8 (per-row scales) and uses a fused INT8 `top1` kernel (DP4A) for the common greedy path where we only need the best token id (`logits==NULL`).
+
+Notes:
+- Strictly opt-in: quantization can change token choices (accuracy). Benchmark and validate on your audio before enabling.
+- First use performs a one-time quantize+upload of the LM head (~`vocab x dim`); you can shift this out of the first transcription call with `VOX_CUDA_PREFETCH=1`.
+- The full streaming pipeline (`VOX_CUDA_PIPELINE_FULL=1`) still uses BF16 tok embeddings on device for the step-embed kernel; enabling INT8 logits may increase VRAM because it keeps both BF16 and INT8 copies.
+
 ### Device RoPE For CUDA Graphs (opt-in)
 
 Enable with:
@@ -248,15 +264,31 @@ BLAS:
 - Encoder: `18400 mel -> 2300 tokens (541742 ms)` (9:02)
 - Decoder: `311 text tokens (2262 steps) in 926821 ms (prefill 7398 ms + 406.6 ms/step)` (15:27)
 
-CUDA:
-- Model load: `39 ms`
-- Wall transcribe: `81686 ms` (1:22)
-- Total (load+transcribe): `81725 ms`
+CUDA (default):
+- Model load: `256 ms`
+- Wall transcribe: `83477 ms` (1:23) (~`2.16xRT` wall vs 180s audio)
+- Total (load+transcribe): `83733 ms`
 - Encoder: `18400 mel -> 2299 tokens (2588 ms)`
-- Decoder: `310 text tokens (2261 steps) in 78625 ms (prefill 1466 ms + 34.1 ms/step)` (1:19)
+- Decoder: `310 text tokens (2261 steps) in 80684 ms (prefill 2607 ms + 34.5 ms/step)` (1:21)
+
+CUDA (`VOX_CUDA_FAST=1`):
+- Model load: `263 ms`
+- Wall transcribe: `35218 ms` (0:35) (~`5.11xRT` wall vs 180s audio)
+- Total (load+transcribe): `35481 ms`
+- Encoder: `18400 mel -> 2299 tokens (2489 ms)`
+- Decoder: `310 text tokens (2261 steps) in 32525 ms (prefill 1506 ms + 13.7 ms/step)` (0:33)
+
+CUDA (`VOX_CUDA_FAST=1 VOX_CUDA_LOGITS_INT8=1`):
+- Model load: `244 ms`
+- Wall transcribe: `32529 ms` (0:33) (~`5.53xRT` wall vs 180s audio)
+- Total (load+transcribe): `32773 ms`
+- Encoder: `18400 mel -> 2299 tokens (2422 ms)`
+- Decoder: `310 text tokens (2261 steps) in 29902 ms (prefill 1474 ms + 12.6 ms/step)` (0:30)
 
 BF16 cache stats at exit (same run):
-- `uploaded=8.23 GiB`, `misses=409`, `hits=415,796`
+- default CUDA: `uploaded=8.23 GiB`, `misses=409`, `hits=416,022`
+- `VOX_CUDA_FAST=1`: `uploaded=8.23 GiB`, `misses=331`, `hits=2,469`
+- `VOX_CUDA_FAST=1 VOX_CUDA_LOGITS_INT8=1`: `uploaded=7.48 GiB`, `misses=330`, `hits=2,468`
 
 ## Profiling Notes
 
