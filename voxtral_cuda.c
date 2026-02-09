@@ -73,6 +73,10 @@ static CUfunction g_fn_attn_v3_partial_dyn_fp16 = 0;
 static CUfunction g_fn_attn_v3_reduce_fp16 = 0;
 static CUfunction g_fn_attn_v4_partial_fp16 = 0;
 static CUfunction g_fn_attn_v4_partial_dyn_fp16 = 0;
+static CUfunction g_fn_attn_v5_partial_fp16 = 0;
+static CUfunction g_fn_attn_v5_partial_dyn_fp16 = 0;
+static CUfunction g_fn_attn_v5_reduce_fp16 = 0;
+static CUfunction g_fn_attn_v5_reduce_dyn_fp16 = 0;
 static CUfunction g_fn_kv_append_dyn_fp16 = 0;
 static CUfunction g_fn_kv_append_dyn_f32 = 0;
 static CUfunction g_fn_causal_attn = 0;
@@ -266,6 +270,19 @@ static int attn_v4_enabled(void) {
         return cached;
     }
     cached = cuda_fast_enabled();
+    return cached;
+}
+
+static int attn_v5_enabled(void) {
+    /* Opt-in: v5 reduces wasted work for short sequences by skipping inactive
+     * chunks (and looping only over active chunks in the reduce kernel).
+     * Keep behind an explicit gate until it has broader validation. */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    const char *disable = getenv("VOX_DISABLE_CUDA_ATTN_V5");
+    if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
+    const char *env = getenv("VOX_CUDA_ATTN_V5");
+    cached = (env && env[0] && env[0] != '0');
     return cached;
 }
 
@@ -1265,6 +1282,17 @@ static int cuda_load_kernel_module(void) {
             if (!g_fn_attn_v4_partial_dyn_fp16)
                 (void)cuModuleGetFunction(&g_fn_attn_v4_partial_dyn_fp16, g_mod, "vox_attn_q4_kv8_fp16_dyn_v4_partial");
         }
+        /* Optional v5 attention kernels (best-effort). */
+        if (g_mod) {
+            if (!g_fn_attn_v5_partial_fp16)
+                (void)cuModuleGetFunction(&g_fn_attn_v5_partial_fp16, g_mod, "vox_attn_q4_kv8_fp16_v5_partial");
+            if (!g_fn_attn_v5_partial_dyn_fp16)
+                (void)cuModuleGetFunction(&g_fn_attn_v5_partial_dyn_fp16, g_mod, "vox_attn_q4_kv8_fp16_dyn_v5_partial");
+            if (!g_fn_attn_v5_reduce_fp16)
+                (void)cuModuleGetFunction(&g_fn_attn_v5_reduce_fp16, g_mod, "vox_attn_q4_kv8_fp16_v5_reduce");
+            if (!g_fn_attn_v5_reduce_dyn_fp16)
+                (void)cuModuleGetFunction(&g_fn_attn_v5_reduce_dyn_fp16, g_mod, "vox_attn_q4_kv8_fp16_dyn_v5_reduce");
+        }
         /* Optional encoder conv-stem kernels (best-effort). */
         if (g_mod) {
             if (!g_fn_im2col_k3_s1_mel)
@@ -1383,6 +1411,12 @@ static int cuda_load_kernel_module(void) {
     /* Optional v4 attention kernels (best-effort). */
     (void)cuModuleGetFunction(&g_fn_attn_v4_partial_fp16, g_mod, "vox_attn_q4_kv8_fp16_v4_partial");
     (void)cuModuleGetFunction(&g_fn_attn_v4_partial_dyn_fp16, g_mod, "vox_attn_q4_kv8_fp16_dyn_v4_partial");
+
+    /* Optional v5 attention kernels (best-effort). */
+    (void)cuModuleGetFunction(&g_fn_attn_v5_partial_fp16, g_mod, "vox_attn_q4_kv8_fp16_v5_partial");
+    (void)cuModuleGetFunction(&g_fn_attn_v5_partial_dyn_fp16, g_mod, "vox_attn_q4_kv8_fp16_dyn_v5_partial");
+    (void)cuModuleGetFunction(&g_fn_attn_v5_reduce_fp16, g_mod, "vox_attn_q4_kv8_fp16_v5_reduce");
+    (void)cuModuleGetFunction(&g_fn_attn_v5_reduce_dyn_fp16, g_mod, "vox_attn_q4_kv8_fp16_dyn_v5_reduce");
     return 1;
 }
 
@@ -2547,6 +2581,39 @@ static int vox_cuda_decoder_attention_step_dev(CUdeviceptr dAttnOut,
     float scale = 1.0f / 11.313708498984761f; /* 1/sqrt(128) */
     CUresult r;
 
+    /* Opt-in v5 path: skip inactive chunks (avoid zero-filling) and reduce only
+     * over active chunks. Implemented only for FP16 KV cache. */
+    int use_v5 = (kv_cache_use_fp16() && attn_v5_enabled() &&
+                  g_fn_attn_v5_partial_fp16 && g_fn_attn_v5_reduce_fp16);
+    if (use_v5) {
+        int n_chunks = VOX_CUDA_ATTN_V3_CHUNKS;
+        if (!ensure_attn_v3_workbufs(n_chunks)) return 0;
+
+        int active_len = total_seq;
+        if (window_size > 0 && active_len > window_size) active_len = window_size;
+        int active_chunks = (active_len + VOX_CUDA_ATTN_V3_CHUNK - 1) / VOX_CUDA_ATTN_V3_CHUNK;
+        if (active_chunks < 1) active_chunks = 1;
+        if (active_chunks > n_chunks) active_chunks = n_chunks;
+
+        void *p_params[] = { &g_dAttnV3_part, &g_dAttnV3_max, &g_dAttnV3_sum,
+                             &dQ, &k_base, &v_base, &dK, &dV,
+                             &total_seq, &window_size, &scale, &n_chunks };
+        r = cuLaunchKernel(g_fn_attn_v5_partial_fp16,
+                           VOX_DEC_KV_HEADS, n_chunks, 1,
+                           128, 1, 1,
+                           0, g_stream, p_params, NULL);
+        if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(dec_attn_v5_partial)", r); return 0; }
+
+        void *r_params[] = { &dAttnOut, &g_dAttnV3_part, &g_dAttnV3_max, &g_dAttnV3_sum,
+                             &n_chunks, &active_chunks };
+        r = cuLaunchKernel(g_fn_attn_v5_reduce_fp16,
+                           VOX_DEC_HEADS, 1, 1,
+                           32, 1, 1,
+                           0, g_stream, r_params, NULL);
+        if (r != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(dec_attn_v5_reduce)", r); return 0; }
+        return 1;
+    }
+
     /* Opt-in v4 path: fuse KV append into v3 partial, then reuse v3 reduce.
      * Implemented only for FP16 KV cache. */
     int use_v4 = (kv_cache_use_fp16() && attn_v4_enabled() &&
@@ -3059,6 +3126,10 @@ void vox_cuda_shutdown(void) {
     g_fn_attn_v3_reduce_fp16 = 0;
     g_fn_attn_v4_partial_fp16 = 0;
     g_fn_attn_v4_partial_dyn_fp16 = 0;
+    g_fn_attn_v5_partial_fp16 = 0;
+    g_fn_attn_v5_partial_dyn_fp16 = 0;
+    g_fn_attn_v5_reduce_fp16 = 0;
+    g_fn_attn_v5_reduce_dyn_fp16 = 0;
     g_fn_kv_append_dyn_fp16 = 0;
     g_fn_kv_append_dyn_f32 = 0;
     g_fn_causal_attn = 0;
@@ -4360,12 +4431,14 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int want_logits_fused) {
 
     int want_fp16 = kv_cache_use_fp16();
     if (want_fp16) {
-        int want_v4 = (attn_v4_enabled() && g_fn_attn_v4_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
-        int want_v3 = (!want_v4 && attn_v3_wanted_for_graph() && g_fn_attn_v3_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
-        if (!want_v4) {
+        int want_v5 = (attn_v5_enabled() && g_fn_attn_v5_partial_dyn_fp16 && g_fn_attn_v5_reduce_dyn_fp16);
+        int want_v4 = (!want_v5 && attn_v4_enabled() && g_fn_attn_v4_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
+        int want_v3 = (!want_v5 && !want_v4 && attn_v3_wanted_for_graph() &&
+                       g_fn_attn_v3_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
+        if (!want_v5 && !want_v4) {
             if (!g_fn_kv_append_dyn_fp16) return 0;
         }
-        if (!want_v4 && !want_v3) {
+        if (!want_v5 && !want_v4 && !want_v3) {
             if (!g_fn_attn_dyn_fp16) return 0;
         }
     } else {
@@ -4439,9 +4512,11 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int want_logits_fused) {
 
     /* v3/v4 scratch buffers must exist before graph capture begins (capture cannot allocate). */
     if (want_fp16) {
-        int want_v4 = (attn_v4_enabled() && g_fn_attn_v4_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
-        int want_v3 = (!want_v4 && attn_v3_wanted_for_graph() && g_fn_attn_v3_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
-        if (want_v4 || want_v3) {
+        int want_v5 = (attn_v5_enabled() && g_fn_attn_v5_partial_dyn_fp16 && g_fn_attn_v5_reduce_dyn_fp16);
+        int want_v4 = (!want_v5 && attn_v4_enabled() && g_fn_attn_v4_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
+        int want_v3 = (!want_v5 && !want_v4 && attn_v3_wanted_for_graph() &&
+                       g_fn_attn_v3_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
+        if (want_v5 || want_v4 || want_v3) {
             if (!ensure_attn_v3_workbufs(VOX_CUDA_ATTN_V3_CHUNKS)) return 0;
         }
     }
@@ -4602,12 +4677,14 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int use_lo
 
     int want_fp16 = kv_cache_use_fp16();
     if (want_fp16) {
-        int want_v4 = (attn_v4_enabled() && g_fn_attn_v4_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
-        int want_v3 = (!want_v4 && attn_v3_wanted_for_graph() && g_fn_attn_v3_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
-        if (!want_v4) {
+        int want_v5 = (attn_v5_enabled() && g_fn_attn_v5_partial_dyn_fp16 && g_fn_attn_v5_reduce_dyn_fp16);
+        int want_v4 = (!want_v5 && attn_v4_enabled() && g_fn_attn_v4_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
+        int want_v3 = (!want_v5 && !want_v4 && attn_v3_wanted_for_graph() &&
+                       g_fn_attn_v3_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
+        if (!want_v5 && !want_v4) {
             if (!g_fn_kv_append_dyn_fp16) return 0;
         }
-        if (!want_v4 && !want_v3) {
+        if (!want_v5 && !want_v4 && !want_v3) {
             if (!g_fn_attn_dyn_fp16) return 0;
         }
     } else {
@@ -4747,9 +4824,11 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int use_lo
     int threads = 256;
     int blocks_kv = (kv_dim + threads - 1) / threads;
     int use_v2 = attn_v2_enabled();
-    int use_v4 = (want_fp16 && attn_v4_enabled() &&
+    int use_v5 = (want_fp16 && attn_v5_enabled() &&
+                  g_fn_attn_v5_partial_dyn_fp16 && g_fn_attn_v5_reduce_dyn_fp16);
+    int use_v4 = (!use_v5 && want_fp16 && attn_v4_enabled() &&
                   g_fn_attn_v4_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
-    int use_v3 = (!use_v4 && want_fp16 && attn_v3_wanted_for_graph() &&
+    int use_v3 = (!use_v5 && !use_v4 && want_fp16 && attn_v3_wanted_for_graph() &&
                   g_fn_attn_v3_partial_dyn_fp16 && g_fn_attn_v3_reduce_fp16);
     int n_chunks_v3 = VOX_CUDA_ATTN_V3_CHUNKS;
 
@@ -4800,7 +4879,24 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int use_lo
         if (!launch_apply_rope(dQ, g_dec_rope_freqs, 1, n_heads, head_dim)) goto capture_fail;
         if (!launch_apply_rope(dK, g_dec_rope_freqs, 1, n_kv_heads, head_dim)) goto capture_fail;
 
-        if (want_fp16 && use_v4) {
+        if (want_fp16 && use_v5) {
+            void *p_params[] = { &g_dAttnV3_part, &g_dAttnV3_max, &g_dAttnV3_sum,
+                                 &dQ, &k_base, &v_base, &dK, &dV, &g_dec_pos_dev,
+                                 &window_size, &attn_scale, &n_chunks_v3 };
+            rr = cuLaunchKernel(g_fn_attn_v5_partial_dyn_fp16,
+                                VOX_DEC_KV_HEADS, n_chunks_v3, 1,
+                                128, 1, 1,
+                                0, g_stream, p_params, NULL);
+            if (rr != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(attn_v5_partial_dyn)", rr); goto capture_fail; }
+
+            void *r_params[] = { &g_dec_attn, &g_dAttnV3_part, &g_dAttnV3_max, &g_dAttnV3_sum,
+                                 &n_chunks_v3, &g_dec_pos_dev, &window_size };
+            rr = cuLaunchKernel(g_fn_attn_v5_reduce_dyn_fp16,
+                                VOX_DEC_HEADS, 1, 1,
+                                32, 1, 1,
+                                0, g_stream, r_params, NULL);
+            if (rr != CUDA_SUCCESS) { log_cu_error("cuLaunchKernel(attn_v5_reduce_dyn)", rr); goto capture_fail; }
+        } else if (want_fp16 && use_v4) {
             /* v4: fuse KV append (float->fp16 write) into the v3 partial kernel. */
             void *p_params[] = { &g_dAttnV3_part, &g_dAttnV3_max, &g_dAttnV3_sum,
                                  &dQ, &k_base, &v_base, &dK, &dV, &g_dec_pos_dev,

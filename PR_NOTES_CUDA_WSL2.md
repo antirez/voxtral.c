@@ -147,6 +147,25 @@ On `samples/antirez_speaking_italian_short.ogg` (converted to WAV; 60s), v3 is a
 
 When CUDA Graphs are enabled, v3 is auto-selected for the graph capture path if available (unless disabled via `VOX_DISABLE_CUDA_ATTN_V3=1`).
 
+### Attention v5 (opt-in)
+
+Enable with:
+
+```bash
+VOX_CUDA_ATTN_V5=1
+```
+
+Notes:
+- v5 is currently implemented for FP16 KV cache only (`VOX_CUDA_KV_FP16=1`, which is the default).
+- v5 keeps the same kernel grid shape as v4 (graph-capture safe), but reduces wasted work for shorter sequences by:
+  - skipping inactive chunks in the partial kernel (no zero-filling)
+  - iterating only the active chunks in the reduce kernel (instead of all `VOX_DEC_WINDOW`-derived chunks)
+
+On `/tmp/vox_iad.wav` (~180s WAV) with `VOX_CUDA_FAST=1`:
+
+- Baseline (v4): `Wall transcribe 33470 ms`, decoder `13.1 ms/step`
+- With v5: `Wall transcribe 33037 ms`, decoder `12.9 ms/step`
+
 ### Merged Decoder Projections (opt-in)
 
 Enable with:
