@@ -156,6 +156,7 @@ static size_t cublaslt_max_workspace_bytes(void) {
 
 typedef struct {
     int M, K, N;
+    int layout_kind; /* 0=legacy row-major layouts, 1=transpose-B view (col-major B=KxN) */
     cublasLtMatmulAlgo_t algo;
     cublasLtMatmulDesc_t op;
     cublasLtMatrixLayout_t a;
@@ -284,6 +285,20 @@ static int logits_fused_enabled(void) {
 static int env_truthy(const char *name) {
     const char *v = getenv(name);
     return v && v[0] && v[0] != '0';
+}
+
+static int cublaslt_transpose_b_enabled(void) {
+    /* Treat device BF16 weight matrices (stored row-major N x K) as a transposed
+     * view for cuBLASLt by describing B as column-major K x N and using
+     * transb = N. This is a zero-copy change intended to improve algo selection
+     * and memory access patterns for M=1 GEMMs. */
+    static int cached = -1;
+    if (cached != -1) return cached;
+    if (env_truthy("VOX_DISABLE_CUBLASLT_TRANSPOSE_B")) { cached = 0; return cached; }
+    const char *env = getenv("VOX_CUDA_CUBLASLT_TRANSPOSE_B");
+    if (env) { cached = (env[0] && env[0] != '0'); return cached; }
+    cached = cuda_fast_enabled();
+    return cached;
 }
 
 static int cublaslt_autotune_enabled(void) {
@@ -1963,12 +1978,13 @@ static int ensure_lt_workspace(size_t needed_bytes) {
     return ensure_buffer(&g_lt_workspace, &g_lt_workspace_cap, needed_bytes);
 }
 
-static lt_algo_entry_t *lt_cache_find(int M, int K, int N) {
+static lt_algo_entry_t *lt_cache_find(int M, int K, int N, int layout_kind) {
     for (int i = 0; i < g_lt_algos_len; i++) {
         if (g_lt_algos[i].valid &&
             g_lt_algos[i].M == M &&
             g_lt_algos[i].K == K &&
-            g_lt_algos[i].N == N) {
+            g_lt_algos[i].N == N &&
+            g_lt_algos[i].layout_kind == layout_kind) {
             return &g_lt_algos[i];
         }
     }
@@ -1993,14 +2009,15 @@ static int lt_autotune_t_bf16(int M, int K, int N,
     if (stream_is_capturing()) return 1;
 
     /* Ensure we have a cache entry (op/layouts). */
-    lt_algo_entry_t *e = lt_cache_find(M, K, N);
+    int layout_kind = cublaslt_transpose_b_enabled() ? 1 : 0;
+    lt_algo_entry_t *e = lt_cache_find(M, K, N, layout_kind);
     if (!e) {
         cublasLtMatmulAlgo_t tmp_algo;
         size_t tmp_ws = 0;
         if (!lt_get_algo_t_bf16(M, K, N, &tmp_algo, &tmp_ws, NULL, NULL, NULL, NULL)) {
             return 1;
         }
-        e = lt_cache_find(M, K, N);
+        e = lt_cache_find(M, K, N, layout_kind);
         if (!e) return 1;
     }
 
@@ -2143,11 +2160,13 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
     if (out_c) *out_c = NULL;
     if (!g_lt_handle) return 0;
 
+    int layout_kind = cublaslt_transpose_b_enabled() ? 1 : 0;
     for (int i = 0; i < g_lt_algos_len; i++) {
         if (g_lt_algos[i].valid &&
             g_lt_algos[i].M == M &&
             g_lt_algos[i].K == K &&
-            g_lt_algos[i].N == N) {
+            g_lt_algos[i].N == N &&
+            g_lt_algos[i].layout_kind == layout_kind) {
             *out_algo = g_lt_algos[i].algo;
             *out_ws = g_lt_algos[i].workspace_bytes;
             if (out_op) *out_op = g_lt_algos[i].op;
@@ -2168,23 +2187,48 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
     st = cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     if (st != CUBLAS_STATUS_SUCCESS) goto fail;
 
-    cublasOperation_t transa = CUBLAS_OP_N;
-    cublasOperation_t transb = CUBLAS_OP_T;
-    (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
-    (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
+    if (layout_kind == 1) {
+        /* For M=1 row-major vectors, column-major and row-major are equivalent for
+         * A/C. Describe weights B (stored row-major N x K) as column-major K x N,
+         * which is a zero-copy transposed view. */
+        cublasOperation_t transa = CUBLAS_OP_N;
+        cublasOperation_t transb = CUBLAS_OP_N;
+        (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
+        (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
 
-    /* Row-major layouts. */
-    st = cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, M, K, K);
-    if (st != CUBLAS_STATUS_SUCCESS) goto fail;
-    st = cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, N, K, K);
-    if (st != CUBLAS_STATUS_SUCCESS) goto fail;
-    st = cublasLtMatrixLayoutCreate(&c, CUDA_R_32F, M, N, N);
-    if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+        /* Mixed layouts: keep A/C in row-major, but represent B as col-major KxN. */
+        st = cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, M, K, K);
+        if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+        st = cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, K, N, K);
+        if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+        st = cublasLtMatrixLayoutCreate(&c, CUDA_R_32F, M, N, N);
+        if (st != CUBLAS_STATUS_SUCCESS) goto fail;
 
-    cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
-    (void)cublasLtMatrixLayoutSetAttribute(a, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
-    (void)cublasLtMatrixLayoutSetAttribute(b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
-    (void)cublasLtMatrixLayoutSetAttribute(c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
+        cublasLtOrder_t order_a = CUBLASLT_ORDER_ROW;
+        cublasLtOrder_t order_b = CUBLASLT_ORDER_COL;
+        cublasLtOrder_t order_c = CUBLASLT_ORDER_ROW;
+        (void)cublasLtMatrixLayoutSetAttribute(a, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_a, sizeof(order_a));
+        (void)cublasLtMatrixLayoutSetAttribute(b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_b, sizeof(order_b));
+        (void)cublasLtMatrixLayoutSetAttribute(c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order_c, sizeof(order_c));
+    } else {
+        cublasOperation_t transa = CUBLAS_OP_N;
+        cublasOperation_t transb = CUBLAS_OP_T;
+        (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa));
+        (void)cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb));
+
+        /* Row-major layouts. */
+        st = cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, M, K, K);
+        if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+        st = cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, N, K, K);
+        if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+        st = cublasLtMatrixLayoutCreate(&c, CUDA_R_32F, M, N, N);
+        if (st != CUBLAS_STATUS_SUCCESS) goto fail;
+
+        cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
+        (void)cublasLtMatrixLayoutSetAttribute(a, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
+        (void)cublasLtMatrixLayoutSetAttribute(b, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
+        (void)cublasLtMatrixLayoutSetAttribute(c, CUBLASLT_MATRIX_LAYOUT_ORDER, &order, sizeof(order));
+    }
 
     st = cublasLtMatmulPreferenceCreate(&pref);
     if (st != CUBLAS_STATUS_SUCCESS) goto fail;
@@ -2208,6 +2252,7 @@ static int lt_get_algo_t_bf16(int M, int K, int N,
     if (g_lt_algos_len < (int)(sizeof(g_lt_algos) / sizeof(g_lt_algos[0]))) {
         g_lt_algos[g_lt_algos_len++] = (lt_algo_entry_t){
             .M = M, .K = K, .N = N,
+            .layout_kind = layout_kind,
             .algo = heur.algo,
             .op = op,
             .a = a,

@@ -15,6 +15,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - `cuInit`, primary context, non-blocking stream
   - cuBLAS + (optional) cuBLASLt for small `M=1` GEMMs
   - Optional cuBLASLt autotune for `M=1` decoder GEMMs (enabled by `VOX_CUDA_FAST=1`; disable with `VOX_DISABLE_CUBLASLT_AUTOTUNE=1`)
+  - Optional cuBLASLt transpose-B view for `M=1` decoder GEMMs (enabled by `VOX_CUDA_FAST=1`; disable with `VOX_DISABLE_CUBLASLT_TRANSPOSE_B=1`)
 - Custom CUDA kernels:
   - Built via `nvcc -cubin` and embedded as a C header (no PTX JIT at runtime).
   - Implements RMSNorm, RoPE, BF16/FP16 casts, SwiGLU/GELU, downsample concat, argmax, etc.

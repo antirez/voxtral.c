@@ -411,6 +411,7 @@ VOX_CUDA_FAST=1 ./voxtral -d voxtral-model -i samples/test_speech.wav
 Notes:
 - `VOX_CUDA_FAST=1` enables a fused top1-only logits path by default when alternatives are disabled (`--alt` not used). Disable it with `VOX_DISABLE_CUDA_LOGITS_FUSED=1` if you want to benchmark the baseline logits+argmax path.
 - `VOX_CUDA_FAST=1` also enables cuBLASLt autotune for the `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_AUTOTUNE=1`.
+- `VOX_CUDA_FAST=1` also enables a cuBLASLt “transpose-B view” for `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_TRANSPOSE_B=1` (or force it with `VOX_CUDA_CUBLASLT_TRANSPOSE_B=0/1`).
 
 To run the extra CUDA benchmark variants (graphs/v3/merged/etc):
 
