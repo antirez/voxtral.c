@@ -265,13 +265,14 @@ static int attn_v4_enabled(void) {
 
 static int logits_fused_enabled(void) {
     /* Opt-in: fused top1-only logits projection (avoids materializing logits[]).
-     * Default off until validated broadly. */
+     * Default on under VOX_CUDA_FAST (can be disabled explicitly). */
     static int cached = -1;
     if (cached != -1) return cached;
     const char *disable = getenv("VOX_DISABLE_CUDA_LOGITS_FUSED");
     if (disable && disable[0] && disable[0] != '0') { cached = 0; return cached; }
     const char *env = getenv("VOX_CUDA_LOGITS_FUSED");
-    cached = (env && env[0] && env[0] != '0');
+    if (env) { cached = (env[0] && env[0] != '0'); return cached; }
+    cached = cuda_fast_enabled();
     return cached;
 }
 

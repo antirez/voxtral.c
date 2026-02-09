@@ -25,7 +25,6 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - Optional host page registration for hot weight ranges: `VOX_CUDA_HOSTREG_GIB=<GiB>` (0 disables; best-effort).
   - Optional prefetch at model load: `VOX_CUDA_PREFETCH=1` (shifts weight uploads out of the first transcription call).
 - Encoder full path:
-  - CPU conv stem remains on CPU by default (small); optional GPU conv stem is available (opt-in).
   - Transformer layers + adapter run on GPU; intermediates stay on device.
 - Decoder full path:
   - Device-side KV cache (FP16 by default) and device-only intermediates.
@@ -36,6 +35,7 @@ The CUDA runtime uses the CUDA Driver API (`libcuda`) and embeds a CUBIN for cus
   - Optional CUDA Graph capture for the single-token decoder step (reduces CPU launch overhead; opt-in).
   - Optional device RoPE freqs generation for CUDA Graph mode (reduces CPU overhead per step; opt-in).
   - Optional logits copy: if `logits==NULL`, logits stay on GPU and only the best token id is copied back.
+  - Optional fused top1-only logits projection (enabled by `VOX_CUDA_FAST=1`): avoids materializing the full-vocab logits buffer when only the best token id is needed.
   - Prefill is attempted on GPU (seq_len > 1) and falls back to the CPU prefill implementation if unsupported/disabled.
 
 ## Build
