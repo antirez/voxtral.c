@@ -47,6 +47,37 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+/* Load INT8 quantized weight if available, otherwise return NULL. */
+static const int8_t *load_int8_direct(safetensors_file_t *sf, const char *name, float *scale_out) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t || !safetensor_is_int8(t)) {
+        return NULL;
+    }
+    float s = safetensors_get_scale(sf, name);
+    if (s <= 0.0f) {
+        fprintf(stderr, "encoder: INT8 per-channel scales not supported: %s\n", name);
+        return NULL;
+    }
+    *scale_out = s;
+    int64_t count;
+    return safetensors_get_int8_direct(sf, t, &count);
+}
+
+/* Try INT8 first, fall back to BF16. Returns 1 if INT8, 0 if BF16. */
+static int load_weight_with_int8_fallback(safetensors_file_t *sf, const char *name,
+                                           const int8_t **int8_out, float *scale_out,
+                                           uint16_t **bf16_out) {
+    *int8_out = load_int8_direct(sf, name, scale_out);
+    if (*int8_out) {
+        *bf16_out = NULL;
+        return 1;
+    }
+    /* Fall back to BF16 */
+    *bf16_out = load_bf16_direct(sf, name);
+    *scale_out = 1.0f;
+    return 0;
+}
+
 int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
     char name[512];
 
@@ -67,21 +98,29 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
         vox_enc_layer_t *l = &enc->layers[i];
         const char *lp = ENC_PREFIX ".transformer.layers";
 
-        /* Large matmul weights: bf16 mmap direct */
+        /* Large matmul weights: try INT8, fall back to bf16 */
+        int use_int8 = 0;
         snprintf(name, sizeof(name), "%s.%d.attention.wq.weight", lp, i);
-        l->wq_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wq_int8, &l->wq_scale, &l->wq_weight_bf16);
         snprintf(name, sizeof(name), "%s.%d.attention.wk.weight", lp, i);
-        l->wk_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wk_int8, &l->wk_scale, &l->wk_weight_bf16);
         snprintf(name, sizeof(name), "%s.%d.attention.wv.weight", lp, i);
-        l->wv_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wv_int8, &l->wv_scale, &l->wv_weight_bf16);
         snprintf(name, sizeof(name), "%s.%d.attention.wo.weight", lp, i);
-        l->wo_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wo_int8, &l->wo_scale, &l->wo_weight_bf16);
         snprintf(name, sizeof(name), "%s.%d.feed_forward.w1.weight", lp, i);
-        l->w1_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->w1_int8, &l->w1_scale, &l->w1_weight_bf16);
+        /* w2 always BF16 for accuracy */
         snprintf(name, sizeof(name), "%s.%d.feed_forward.w2.weight", lp, i);
         l->w2_weight_bf16 = load_bf16_direct(sf, name);
         snprintf(name, sizeof(name), "%s.%d.feed_forward.w3.weight", lp, i);
-        l->w3_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->w3_int8, &l->w3_scale, &l->w3_weight_bf16);
 
         /* Small weights: biases and norms (always f32) */
         snprintf(name, sizeof(name), "%s.%d.attention.wq.bias", lp, i);
@@ -98,14 +137,20 @@ int vox_encoder_load(vox_encoder_t *enc, safetensors_file_t *sf) {
         snprintf(name, sizeof(name), "%s.%d.ffn_norm.weight", lp, i);
         l->ffn_norm = load_f32(sf, name);
 
-        if (!l->wq_weight_bf16 || !l->wk_weight_bf16 ||
-            !l->wv_weight_bf16 || !l->wo_weight_bf16) {
+        /* Check if any required weight is missing (allow mixed BF16/INT8) */
+        int has_wq = l->wq_weight_bf16 || l->wq_int8;
+        int has_wk = l->wk_weight_bf16 || l->wk_int8;
+        int has_wv = l->wv_weight_bf16 || l->wv_int8;
+        int has_wo = l->wo_weight_bf16 || l->wo_int8;
+        if (!has_wq || !has_wk || !has_wv || !has_wo) {
             fprintf(stderr, "encoder: failed to load layer %d weights\n", i);
             return -1;
         }
 
-        if (vox_verbose >= 2)
-            fprintf(stderr, "  Encoder layer %d/%d loaded\n", i + 1, VOX_ENC_LAYERS);
+        if (vox_verbose >= 2) {
+            fprintf(stderr, "  Encoder layer %d/%d loaded%s\n", i + 1, VOX_ENC_LAYERS,
+                    use_int8 > 0 ? " (INT8)" : " (BF16)");
+        }
     }
 
     /* Final norm */

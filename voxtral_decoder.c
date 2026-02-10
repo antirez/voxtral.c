@@ -46,6 +46,40 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
+/* Load INT8 quantized weight if available, otherwise return NULL.
+ * Sets *scale_out to the dequantization scale (per-tensor). */
+static const int8_t *load_int8_direct(safetensors_file_t *sf, const char *name,
+                                       float *scale_out) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t || !safetensor_is_int8(t)) {
+        return NULL;
+    }
+    float s = safetensors_get_scale(sf, name);
+    if (s <= 0.0f) {
+        fprintf(stderr, "decoder: INT8 per-channel scales not supported: %s\n", name);
+        return NULL;
+    }
+    *scale_out = s;
+
+    int64_t count;
+    return safetensors_get_int8_direct(sf, t, &count);
+}
+
+/* Try INT8 first, fall back to BF16. Returns 1 if INT8, 0 if BF16. */
+static int load_weight_with_int8_fallback(safetensors_file_t *sf, const char *name,
+                                           const int8_t **int8_out, float *scale_out,
+                                           uint16_t **bf16_out) {
+    *int8_out = load_int8_direct(sf, name, scale_out);
+    if (*int8_out) {
+        *bf16_out = NULL;
+        return 1;
+    }
+    /* Fall back to BF16 */
+    *bf16_out = load_bf16_direct(sf, name);
+    *scale_out = 1.0f;
+    return 0;
+}
+
 int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
     char name[512];
 
@@ -64,40 +98,54 @@ int vox_decoder_load(vox_decoder_t *dec, safetensors_file_t *sf) {
         snprintf(name, sizeof(name), "layers.%d.ada_rms_norm_t_cond.2.weight", i);
         l->ada_norm_up = load_f32(sf, name);
 
-        /* Attention (large matmul weights: bf16 mmap direct) */
+        /* Attention (large matmul weights: try INT8, fall back to bf16) */
+        int use_int8 = 0;
         snprintf(name, sizeof(name), "layers.%d.attention.wq.weight", i);
-        l->wq_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wq_int8, &l->wq_scale, &l->wq_weight_bf16);
         snprintf(name, sizeof(name), "layers.%d.attention.wk.weight", i);
-        l->wk_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wk_int8, &l->wk_scale, &l->wk_weight_bf16);
         snprintf(name, sizeof(name), "layers.%d.attention.wv.weight", i);
-        l->wv_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wv_int8, &l->wv_scale, &l->wv_weight_bf16);
         snprintf(name, sizeof(name), "layers.%d.attention.wo.weight", i);
-        l->wo_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->wo_int8, &l->wo_scale, &l->wo_weight_bf16);
 
         /* Norms (small, always f32) */
         snprintf(name, sizeof(name), "layers.%d.attention_norm.weight", i);
         l->attention_norm = load_f32(sf, name);
 
-        /* FFN (large matmul weights: bf16 mmap direct) */
+        /* FFN (large matmul weights: try INT8, fall back to bf16) */
         snprintf(name, sizeof(name), "layers.%d.feed_forward.w1.weight", i);
-        l->w1_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->w1_int8, &l->w1_scale, &l->w1_weight_bf16);
+        /* w2 always BF16 for accuracy (kept in quantize_weights.py) */
         snprintf(name, sizeof(name), "layers.%d.feed_forward.w2.weight", i);
         l->w2_weight_bf16 = load_bf16_direct(sf, name);
         snprintf(name, sizeof(name), "layers.%d.feed_forward.w3.weight", i);
-        l->w3_weight_bf16 = load_bf16_direct(sf, name);
+        use_int8 += load_weight_with_int8_fallback(sf, name,
+            &l->w3_int8, &l->w3_scale, &l->w3_weight_bf16);
 
         /* Norms (small, always f32) */
         snprintf(name, sizeof(name), "layers.%d.ffn_norm.weight", i);
         l->ffn_norm = load_f32(sf, name);
 
-        if (!l->wq_weight_bf16 || !l->wk_weight_bf16 ||
-            !l->wv_weight_bf16 || !l->wo_weight_bf16) {
+        /* Check if any required weight is missing (allow mixed BF16/INT8) */
+        int has_wq = l->wq_weight_bf16 || l->wq_int8;
+        int has_wk = l->wk_weight_bf16 || l->wk_int8;
+        int has_wv = l->wv_weight_bf16 || l->wv_int8;
+        int has_wo = l->wo_weight_bf16 || l->wo_int8;
+        if (!has_wq || !has_wk || !has_wv || !has_wo) {
             fprintf(stderr, "decoder: failed to load layer %d\n", i);
             return -1;
         }
 
-        if (vox_verbose >= 2)
-            fprintf(stderr, "  Decoder layer %d/%d loaded\n", i + 1, VOX_DEC_LAYERS);
+        if (vox_verbose >= 2) {
+            fprintf(stderr, "  Decoder layer %d/%d loaded%s\n", i + 1, VOX_DEC_LAYERS,
+                    use_int8 > 0 ? " (INT8)" : " (BF16)");
+        }
     }
 
     /* Final norm */
@@ -270,11 +318,28 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
     /* GPU monolithic prefill: all 26 layers in one command buffer */
 #ifdef USE_METAL
     if (vox_metal_available()) {
-        vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs);
-        free(x); free(x_norm); free(q); free(k); free(v);
-        free(attn_out); free(proj_out); free(ffn_out);
-        free(positions); free(rope_freqs);
-        return;
+        if (vox_metal_decoder_prefill_step(ctx, x, seq_len, rope_freqs)) {
+            /* GPU prefill succeeded */
+            free(x); free(x_norm); free(q); free(k); free(v);
+            free(attn_out); free(proj_out); free(ffn_out);
+            free(positions); free(rope_freqs);
+            return;
+        }
+        /* GPU prefill not available (e.g., INT8 weights).
+         * Check if CPU fallback is possible (requires BF16 weights). */
+        if (dec->layers[0].wq_weight_bf16 == NULL) {
+            /* INT8 model without GPU prefill: process tokens one at a time.
+             * This is slower but works with the per-step INT8 GPU decoder. */
+            float *logits = (float *)malloc(VOX_VOCAB_SIZE * sizeof(float));
+            for (int i = 0; i < seq_len; i++) {
+                vox_decoder_forward(ctx, input_embeds + (size_t)i * dim, logits);
+            }
+            free(logits);
+            free(x); free(x_norm); free(q); free(k); free(v);
+            free(attn_out); free(proj_out); free(ffn_out);
+            free(positions); free(rope_freqs);
+            return;
+        }
     }
 #endif
 

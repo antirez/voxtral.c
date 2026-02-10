@@ -593,3 +593,502 @@ kernel void silu_mul_merged(
     g = g / (1.0f + exp(-g));  /* silu */
     data[idx_gate] = g * data[idx_up];
 }
+
+/* ========================================================================
+ * INT8 GEMV: y[N] = x[K] @ W[K,N] where W is INT8 with per-tensor scale.
+ *
+ * Optimized for single-token decode (M=1, memory-bound).
+ * Weight layout: W[K,N] row-major (K rows, N cols), stored as INT8.
+ * Dequantization: float_val = int8_val * scale
+ *
+ * Strategy:
+ * - Each threadgroup computes TILE_N=4 consecutive output elements.
+ * - 256 threads per threadgroup, each handles K/256 elements.
+ * - Use simd_sum for fast parallel reduction across K dimension.
+ * - Load 4 bytes (4 INT8) per thread per iteration = 1KB per threadgroup.
+ *
+ * Grid: (N/TILE_N) threadgroups. Each outputs 4 floats.
+ * ======================================================================== */
+
+#define GEMV_TILE_N 4
+#define GEMV_THREADS 512
+
+kernel void int8_gemv(
+    device const float *x [[buffer(0)]],        /* Input: [K] */
+    device const char *W [[buffer(1)]],         /* Weights: [N, K] INT8 row-major (PyTorch layout) */
+    device float *y [[buffer(2)]],              /* Output: [N] */
+    constant float &scale [[buffer(3)]],        /* Dequant scale */
+    constant int &K [[buffer(4)]],
+    constant int &N [[buffer(5)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    int n_base = (int)group_id * GEMV_TILE_N;
+    if (n_base >= N) return;
+
+    /* Partial sums for TILE_N outputs */
+    float acc[GEMV_TILE_N] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    /* Vectorized: process 4 K elements at a time using char4 loads */
+    int K4 = K / 4;
+    device const char4 *W4 = (device const char4 *)W;
+    device const float4 *x4 = (device const float4 *)x;
+
+    for (int k4 = (int)tid; k4 < K4; k4 += GEMV_THREADS) {
+        float4 xv = x4[k4];
+
+        /* Load TILE_N weight vectors: W is [N, K] row-major */
+        for (int t = 0; t < GEMV_TILE_N; t++) {
+            int n = n_base + t;
+            if (n < N) {
+                char4 wv = W4[n * K4 + k4];
+                acc[t] += xv.x * float(wv.x) + xv.y * float(wv.y) +
+                          xv.z * float(wv.z) + xv.w * float(wv.w);
+            }
+        }
+    }
+
+    /* Handle remainder (K not divisible by 4) */
+    int k_rem_start = K4 * 4;
+    for (int k = k_rem_start + (int)tid; k < K; k += GEMV_THREADS) {
+        float x_val = x[k];
+        for (int t = 0; t < GEMV_TILE_N; t++) {
+            int n = n_base + t;
+            if (n < N) {
+                char w_int8 = W[n * K + k];
+                acc[t] += x_val * float(w_int8);
+            }
+        }
+    }
+
+    /* SIMD reduction: sum across threads in same SIMD group */
+    for (int t = 0; t < GEMV_TILE_N; t++) {
+        acc[t] = simd_sum(acc[t]);
+    }
+
+    /* Cross-SIMD reduction using threadgroup memory */
+    threadgroup float shared[16 * GEMV_TILE_N];  /* 16 SIMD groups (512 threads / 32) */
+    if (simd_lid == 0) {
+        for (int t = 0; t < GEMV_TILE_N; t++) {
+            shared[simd_gid * GEMV_TILE_N + t] = acc[t];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* First TILE_N threads finalize and write output */
+    if (tid < GEMV_TILE_N) {
+        int n = n_base + (int)tid;
+        if (n < N) {
+            float sum = 0.0f;
+            int n_simd_groups = GEMV_THREADS / 32;
+            for (int g = 0; g < n_simd_groups; g++) {
+                sum += shared[g * GEMV_TILE_N + (int)tid];
+            }
+            y[n] = sum * scale;
+        }
+    }
+}
+
+/* ========================================================================
+ * INT8 GEMM: C[M,N] = A[M,K] @ B[K,N] where B is INT8 with per-tensor scale.
+ *
+ * Tiled GEMM for batched decode / encoder prefill (M > 1).
+ * Uses threadgroup shared memory for A tile (F32) and B tile (dequant'd F32).
+ *
+ * Tile sizes: TILE_M=8, TILE_N=32, TILE_K=32.
+ * Threadgroup: 8x32 = 256 threads. Each thread computes one C element.
+ *
+ * Grid: (ceil(N/TILE_N), ceil(M/TILE_M)) threadgroups.
+ * ======================================================================== */
+
+#define TILE_M 8
+#define TILE_N 32
+#define TILE_K 32
+
+kernel void int8_gemm(
+    device const float *A [[buffer(0)]],        /* Input: [M, K] */
+    device const char *B [[buffer(1)]],         /* Weights: [N, K] INT8 row-major (PyTorch layout) */
+    device float *C [[buffer(2)]],              /* Output: [M, N] */
+    constant float &scale [[buffer(3)]],        /* Dequant scale */
+    constant int &M [[buffer(4)]],
+    constant int &K [[buffer(5)]],
+    constant int &N [[buffer(6)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint2 local_id [[thread_position_in_threadgroup]]
+) {
+    int m_base = (int)group_id.y * TILE_M;
+    int n_base = (int)group_id.x * TILE_N;
+
+    int local_m = (int)local_id.y;  /* 0..TILE_M-1 */
+    int local_n = (int)local_id.x;  /* 0..TILE_N-1 */
+
+    int global_m = m_base + local_m;
+    int global_n = n_base + local_n;
+
+    /* Shared memory tiles */
+    threadgroup float A_tile[TILE_M][TILE_K];
+    threadgroup float B_tile[TILE_K][TILE_N];
+
+    float acc = 0.0f;
+
+    /* Loop over K in tiles */
+    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+        /* Cooperative load: A tile (8x32 threads load 8x32 tile) */
+        /* Each thread loads one element */
+        int a_k = k0 + local_n;  /* local_n = 0..31, but TILE_K=32 */
+        if (local_n < TILE_K && global_m < M && a_k < K) {
+            A_tile[local_m][local_n] = A[global_m * K + a_k];
+        } else if (local_n < TILE_K) {
+            A_tile[local_m][local_n] = 0.0f;
+        }
+
+        /* Cooperative load + dequant: B tile using char4 vectorized loads
+         * B is [N, K] row-major (PyTorch layout), we want W^T for C = A @ W^T
+         * Access: B[n, k] at memory B[n * K + k]
+         * 256 threads each load 4 consecutive k-values (char4) for one n-row. */
+        int flat_id = local_m * TILE_N + local_n; /* 0..255 */
+        int load_n = flat_id / 8;         /* 0..31: which n row */
+        int k_chunk = flat_id % 8;        /* 0..7: which char4 chunk */
+        int load_k_base = k_chunk * 4;    /* 0, 4, 8, ..., 28 */
+
+        int b_n = n_base + load_n;
+        int b_k_base = k0 + load_k_base;
+
+        if (b_n < N && b_k_base + 3 < K) {
+            /* Fast path: load 4 consecutive k-values as char4 */
+            device const char4 *ptr = (device const char4 *)(B + b_n * K + b_k_base);
+            char4 data = *ptr;
+            B_tile[load_k_base + 0][load_n] = float(data.x);
+            B_tile[load_k_base + 1][load_n] = float(data.y);
+            B_tile[load_k_base + 2][load_n] = float(data.z);
+            B_tile[load_k_base + 3][load_n] = float(data.w);
+        } else {
+            /* Boundary handling: load individual bytes */
+            for (int dk = 0; dk < 4; dk++) {
+                int b_k = b_k_base + dk;
+                if (b_n < N && b_k < K) {
+                    B_tile[load_k_base + dk][load_n] = float(B[b_n * K + b_k]);
+                } else {
+                    B_tile[load_k_base + dk][load_n] = 0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Compute partial products */
+        if (global_m < M && global_n < N) {
+            for (int kk = 0; kk < TILE_K; kk++) {
+                acc += A_tile[local_m][kk] * B_tile[kk][local_n];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* Write output */
+    if (global_m < M && global_n < N) {
+        C[global_m * N + global_n] = acc * scale;
+    }
+}
+
+/* ========================================================================
+ * Fused INT8 GEMM for decoder QKV (batched prefill).
+ *
+ * Computes:
+ *   Q[M, Nq] = A[M, K] @ Wq[Nq, K]^T
+ *   K[M, Nk] = A[M, K] @ Wk[Nk, K]^T
+ *   V[M, Nv] = A[M, K] @ Wv[Nv, K]^T
+ *
+ * Weight layout: W*[N, K] INT8 row-major (PyTorch layout).
+ *
+ * Tile sizes match int8_gemm: TILE_M=8, TILE_N=32, TILE_K=32.
+ * Grid: (ceil((Nq+Nk+Nv)/TILE_N), ceil(M/TILE_M)).
+ * ======================================================================== */
+
+kernel void int8_gemm_qkv(
+    device const float *A [[buffer(0)]],        /* Input: [M, K] */
+    device const char *Wq [[buffer(1)]],        /* Weights: [Nq, K] INT8 */
+    device const char *Wk [[buffer(2)]],        /* Weights: [Nk, K] INT8 */
+    device const char *Wv [[buffer(3)]],        /* Weights: [Nv, K] INT8 */
+    device float *Q [[buffer(4)]],              /* Output: [M, Nq] */
+    device float *Kout [[buffer(5)]],           /* Output: [M, Nk] */
+    device float *Vout [[buffer(6)]],           /* Output: [M, Nv] */
+    constant float &scale_q [[buffer(7)]],      /* Scalar scale for Q */
+    constant float &scale_k [[buffer(8)]],      /* Scalar scale for K */
+    constant float &scale_v [[buffer(9)]],      /* Scalar scale for V */
+    constant int &M [[buffer(10)]],
+    constant int &Kdim [[buffer(11)]],
+    constant int &Nq [[buffer(12)]],
+    constant int &Nk [[buffer(13)]],
+    constant int &Nv [[buffer(14)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint2 local_id [[thread_position_in_threadgroup]]
+) {
+    int m_base = (int)group_id.y * TILE_M;
+    int n_base = (int)group_id.x * TILE_N;
+    int Ntotal = Nq + Nk + Nv;
+
+    /* Choose the source weights once per tile when the tile does not cross
+     * the Q/K/V boundaries. This avoids per-element branching in the inner
+     * load loop. */
+    int n_offset = 0;
+    int Nout = Nq;
+    device const char *W = Wq;
+    device float *Out = Q;
+    float scalar_scale = scale_q;
+    int mixed_tile = 0;
+    int n_end = n_base + TILE_N - 1;
+    if (n_end < Nq) {
+        /* Q */
+    } else if (n_base >= Nq && n_end < Nq + Nk) {
+        /* K */
+        n_offset = Nq;
+        Nout = Nk;
+        W = Wk;
+        Out = Kout;
+        scalar_scale = scale_k;
+    } else if (n_base >= Nq + Nk) {
+        /* V */
+        n_offset = Nq + Nk;
+        Nout = Nv;
+        W = Wv;
+        Out = Vout;
+        scalar_scale = scale_v;
+    } else {
+        mixed_tile = 1;
+    }
+
+    int local_m = (int)local_id.y;
+    int local_n = (int)local_id.x;
+
+    int global_m = m_base + local_m;
+    int global_n = n_base + local_n;
+
+    threadgroup float A_tile[TILE_M][TILE_K];
+    threadgroup float B_tile[TILE_K][TILE_N];
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < Kdim; k0 += TILE_K) {
+        int a_k = k0 + local_n;
+        if (local_n < TILE_K && global_m < M && a_k < Kdim) {
+            A_tile[local_m][local_n] = A[global_m * Kdim + a_k];
+        } else if (local_n < TILE_K) {
+            A_tile[local_m][local_n] = 0.0f;
+        }
+
+        /* Cooperative B tile load with char4 vectorized loads for non-mixed tiles.
+         * TILE_K=32 / 4 = 8 char4 chunks per row, 256 threads (TILE_M * TILE_N)
+         * cover all 32 rows × 8 chunks = 256 loads exactly. */
+        int flat_id = local_m * TILE_N + local_n;
+        int load_n_idx = flat_id / 8;      /* 0..31: which n row */
+        int k_chunk = flat_id % 8;         /* 0..7: which char4 chunk */
+        int load_k_base = k_chunk * 4;     /* 0, 4, 8, ..., 28 */
+
+        int b_n = n_base + load_n_idx;
+        int b_k_base = k0 + load_k_base;
+
+        if (!mixed_tile && b_n < Ntotal && b_k_base + 3 < Kdim) {
+            /* Fast path: use char4 vectorized loads */
+            int row = b_n - n_offset;
+            device const char4 *ptr = (device const char4 *)(W + row * Kdim + b_k_base);
+            char4 data = *ptr;
+            B_tile[load_k_base + 0][load_n_idx] = float(data.x);
+            B_tile[load_k_base + 1][load_n_idx] = float(data.y);
+            B_tile[load_k_base + 2][load_n_idx] = float(data.z);
+            B_tile[load_k_base + 3][load_n_idx] = float(data.w);
+        } else {
+            /* Slow path: mixed tile or boundary conditions */
+            int tile_elems = TILE_K * TILE_N;
+            int tg_elems = TILE_M * TILE_N;
+            for (int idx = flat_id; idx < tile_elems; idx += tg_elems) {
+                int load_k = idx / TILE_N;
+                int load_n = idx % TILE_N;
+                int b_k = k0 + load_k;
+                int bn = n_base + load_n;
+
+                if (b_k < Kdim && bn < Ntotal) {
+                    char w_int8 = 0;
+                    if (!mixed_tile) {
+                        int row = bn - n_offset;
+                        w_int8 = W[row * Kdim + b_k];
+                    } else {
+                        device const char *Wm = Wq;
+                        int row = bn;
+                        if (bn >= Nq) {
+                            if (bn < Nq + Nk) {
+                                Wm = Wk;
+                                row = bn - Nq;
+                            } else {
+                                Wm = Wv;
+                                row = bn - (Nq + Nk);
+                            }
+                        }
+                        w_int8 = Wm[row * Kdim + b_k];
+                    }
+                    B_tile[load_k][load_n] = float(w_int8);
+                } else {
+                    B_tile[load_k][load_n] = 0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (global_m < M && global_n < Ntotal) {
+            for (int kk = 0; kk < TILE_K; kk++) {
+                acc += A_tile[local_m][kk] * B_tile[kk][local_n];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (global_m < M && global_n < Ntotal) {
+        if (!mixed_tile) {
+            int col = global_n - n_offset;
+            Out[global_m * Nout + col] = acc * scalar_scale;
+        } else {
+            if (global_n < Nq) {
+                Q[global_m * Nq + global_n] = acc * scale_q;
+            } else if (global_n < Nq + Nk) {
+                int n_k = global_n - Nq;
+                Kout[global_m * Nk + n_k] = acc * scale_k;
+            } else {
+                int n_v = global_n - (Nq + Nk);
+                Vout[global_m * Nv + n_v] = acc * scale_v;
+            }
+        }
+    }
+}
+
+/* ========================================================================
+ * Fused INT8 GEMM for decoder FFN W1+W3 (batched prefill).
+ *
+ * Computes merged output:
+ *   C[M, 2*hidden] = A[M, K] @ [W1; W3]^T
+ *
+ * Data layout in C matches silu_mul_merged kernel:
+ *   row i: [gate(hidden), up(hidden)]
+ * ======================================================================== */
+
+kernel void int8_gemm_w1w3(
+    device const float *A [[buffer(0)]],         /* Input: [M, K] */
+    device const char *W1 [[buffer(1)]],         /* Weights: [hidden, K] INT8 */
+    device const char *W3 [[buffer(2)]],         /* Weights: [hidden, K] INT8 */
+    device float *C [[buffer(3)]],               /* Output: [M, 2*hidden] */
+    constant float &scale_1 [[buffer(4)]],       /* Scalar scale for W1 */
+    constant float &scale_3 [[buffer(5)]],       /* Scalar scale for W3 */
+    constant int &M [[buffer(6)]],
+    constant int &Kdim [[buffer(7)]],
+    constant int &hidden [[buffer(8)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint2 local_id [[thread_position_in_threadgroup]]
+) {
+    int m_base = (int)group_id.y * TILE_M;
+    int n_base = (int)group_id.x * TILE_N;
+    int Ntotal = hidden * 2;
+
+    /* Select weights once per tile when the tile does not cross the W1/W3 boundary. */
+    int n_offset = 0;
+    device const char *W = W1;
+    float scalar_scale = scale_1;
+    int mixed_tile = 0;
+    int n_end = n_base + TILE_N - 1;
+    if (n_end < hidden) {
+        /* W1 */
+    } else if (n_base >= hidden) {
+        /* W3 */
+        n_offset = hidden;
+        W = W3;
+        scalar_scale = scale_3;
+    } else {
+        mixed_tile = 1;
+    }
+
+    int local_m = (int)local_id.y;
+    int local_n = (int)local_id.x;
+
+    int global_m = m_base + local_m;
+    int global_n = n_base + local_n;
+
+    threadgroup float A_tile[TILE_M][TILE_K];
+    threadgroup float B_tile[TILE_K][TILE_N];
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < Kdim; k0 += TILE_K) {
+        int a_k = k0 + local_n;
+        if (local_n < TILE_K && global_m < M && a_k < Kdim) {
+            A_tile[local_m][local_n] = A[global_m * Kdim + a_k];
+        } else if (local_n < TILE_K) {
+            A_tile[local_m][local_n] = 0.0f;
+        }
+
+        /* Cooperative load using char4 vectorized loads (non-mixed case) */
+        int flat_id = local_m * TILE_N + local_n;
+        int load_n_idx = flat_id / 8;      /* 0..31: which n row */
+        int k_chunk = flat_id % 8;         /* 0..7: which char4 chunk */
+        int load_k_base = k_chunk * 4;     /* 0, 4, 8, ..., 28 */
+
+        int b_n = n_base + load_n_idx;
+        int b_k_base = k0 + load_k_base;
+
+        if (!mixed_tile && b_n < Ntotal && b_k_base + 3 < Kdim) {
+            /* Fast path: non-mixed tile, load 4 consecutive k-values as char4 */
+            int row = b_n - n_offset;
+            device const char4 *ptr = (device const char4 *)(W + row * Kdim + b_k_base);
+            char4 data = *ptr;
+            B_tile[load_k_base + 0][load_n_idx] = float(data.x);
+            B_tile[load_k_base + 1][load_n_idx] = float(data.y);
+            B_tile[load_k_base + 2][load_n_idx] = float(data.z);
+            B_tile[load_k_base + 3][load_n_idx] = float(data.w);
+        } else {
+            /* Slow path: boundary or mixed tile */
+            for (int dk = 0; dk < 4; dk++) {
+                int b_k = b_k_base + dk;
+                if (b_k < Kdim && b_n < Ntotal) {
+                    char w_int8 = 0;
+                    if (!mixed_tile) {
+                        int row = b_n - n_offset;
+                        w_int8 = W[row * Kdim + b_k];
+                    } else {
+                        device const char *Wm = (b_n < hidden) ? W1 : W3;
+                        int row = (b_n < hidden) ? b_n : (b_n - hidden);
+                        w_int8 = Wm[row * Kdim + b_k];
+                    }
+                    B_tile[load_k_base + dk][load_n_idx] = float(w_int8);
+                } else {
+                    B_tile[load_k_base + dk][load_n_idx] = 0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (global_m < M && global_n < Ntotal) {
+            for (int kk = 0; kk < TILE_K; kk++) {
+                acc += A_tile[local_m][kk] * B_tile[kk][local_n];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (global_m < M && global_n < Ntotal) {
+        if (!mixed_tile) {
+            int col = global_n - n_offset;
+            C[global_m * Ntotal + global_n] = acc * scalar_scale;
+        } else {
+            if (global_n < hidden) {
+                C[global_m * Ntotal + global_n] = acc * scale_1;
+            } else {
+                int n3 = global_n - hidden;
+                C[global_m * Ntotal + global_n] = acc * scale_3;
+            }
+        }
+    }
+}

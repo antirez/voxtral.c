@@ -250,9 +250,10 @@ int vox_metal_encoder_full_step(void *ctx, float *x, int new_len,
  * x is [seq_len, VOX_DEC_DIM] float, modified in-place.
  * rope_freqs: [seq_len, head_dim/2, 2] precomputed frequencies.
  * Updates ctx->kv_cache_len internally.
+ * Returns 1 on success, 0 if caller should fall back to CPU (e.g., INT8 weights).
  */
-void vox_metal_decoder_prefill_step(void *ctx, float *x, int seq_len,
-                                      const float *rope_freqs);
+int vox_metal_decoder_prefill_step(void *ctx, float *x, int seq_len,
+                                    const float *rope_freqs);
 
 /* GPU memory usage (for debugging). */
 size_t vox_metal_memory_used(void);

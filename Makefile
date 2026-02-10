@@ -18,7 +18,7 @@ TARGET = voxtral
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas mps inspect test
+.PHONY: all clean debug info help blas mps inspect quantize test
 
 # Default: show available targets
 all: help
@@ -38,6 +38,7 @@ endif
 	@echo "  make test     - Run regression tests (slow, needs fast GPU)"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make inspect  - Build safetensors weight inspector"
+	@echo "  make quantize - Build INT8 quantization tool"
 	@echo "  make info     - Show build configuration"
 	@echo ""
 	@echo "Example: make blas && ./voxtral -d voxtral-model -i audio.wav"
@@ -117,6 +118,13 @@ inspect: inspect_weights.o voxtral_safetensors.o
 	$(CC) $(CFLAGS) -o inspect_weights $^ $(LDFLAGS)
 
 # =============================================================================
+# Quantization utility
+# =============================================================================
+quantize: CFLAGS = $(CFLAGS_BASE)
+quantize: quantize_int8.o
+	$(CC) $(CFLAGS) -o quantize_int8 $^ $(LDFLAGS)
+
+# =============================================================================
 # Test
 # =============================================================================
 test:
@@ -126,7 +134,7 @@ test:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o quantize_int8.o $(TARGET) inspect_weights quantize_int8
 	rm -f voxtral_shaders_source.h
 
 info:
@@ -156,3 +164,4 @@ voxtral_safetensors.o: voxtral_safetensors.c voxtral_safetensors.h
 main.o: main.c voxtral.h voxtral_kernels.h voxtral_mic.h
 voxtral_mic_macos.o: voxtral_mic_macos.c voxtral_mic.h
 inspect_weights.o: inspect_weights.c voxtral_safetensors.h
+quantize_int8.o: quantize_int8.c

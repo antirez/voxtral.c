@@ -138,6 +138,31 @@ To convert files to WAV format, just use `ffmpeg`:
 The above command line works for many file types, not just for OGG files, of course.
 There are two example wave files under the `samples` directory.
 
+### Quantization (INT8)
+
+A separate quantization tool (`quantize_int8.c`) is provided to convert the BF16 weights to INT8 with per-tensor scale factors, reducing GPU memory usage at the cost of some quality. Usage:
+
+```bash
+./quantize_int8 voxtral-model voxtral-model-q8
+```
+
+The quantized model can be used via the `-d voxtral-model-q8` flag. The int8 quantization is only supported on the MPS backend due to custom GPU kernels that utilize the per-tensor scales. The BLAS backend does not support int8.
+
+ie.
+
+```bash
+./voxtral -d voxtral-model-q8 --from-mic
+# Loading weights...
+# Metal GPU: 4061.2 MB
+# Model loaded.
+# Listening (Ctrl+C to stop)...
+# Check, check. Is the quantized model working as expected? Seems to be.^C
+# Stopping...
+
+# Encoder: 1629 mel -> 203 tokens (906 ms)
+# Decoder: 17 text tokens (165 steps) in 4276 ms (prefill 495 ms + 23.1 ms/step)
+```
+
 ### C API
 
 The library exposes a streaming API (`vox_stream_t`) that works for both offline and real-time use. You feed audio samples and retrieve decoded token strings as they become available.

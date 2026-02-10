@@ -98,13 +98,49 @@ static uint16_t *load_bf16_direct(safetensors_file_t *sf, const char *name) {
     return safetensors_get_bf16_direct(sf, t);
 }
 
-static int vox_adapter_load(vox_adapter_t *adapter, safetensors_file_t *sf) {
-    adapter->linear0_weight_bf16 = load_bf16_direct(sf,
-        "mm_streams_embeddings.embedding_module.audio_language_projection.0.weight");
-    adapter->linear1_weight_bf16 = load_bf16_direct(sf,
-        "mm_streams_embeddings.embedding_module.audio_language_projection.2.weight");
+/* Load INT8 quantized weight if available, otherwise return NULL. */
+static const int8_t *load_int8_direct(safetensors_file_t *sf, const char *name, float *scale_out) {
+    const safetensor_t *t = safetensors_find(sf, name);
+    if (!t || !safetensor_is_int8(t)) {
+        return NULL;
+    }
+    float s = safetensors_get_scale(sf, name);
+    if (s <= 0.0f) {
+        fprintf(stderr, "adapter: INT8 per-channel scales not supported: %s\n", name);
+        return NULL;
+    }
+    *scale_out = s;
+    int64_t count;
+    return safetensors_get_int8_direct(sf, t, &count);
+}
 
-    if (!adapter->linear0_weight_bf16 || !adapter->linear1_weight_bf16) return -1;
+/* Try INT8 first, fall back to BF16. Returns 1 if INT8, 0 if BF16, -1 if not found. */
+static int load_weight_with_int8_fallback(safetensors_file_t *sf, const char *name,
+                                           const int8_t **int8_out, float *scale_out,
+                                           uint16_t **bf16_out) {
+    *int8_out = load_int8_direct(sf, name, scale_out);
+    if (*int8_out) {
+        *bf16_out = NULL;
+        return 1;
+    }
+    /* Fall back to BF16 */
+    *bf16_out = load_bf16_direct(sf, name);
+    *scale_out = 1.0f;
+    if (*bf16_out) return 0;
+    fprintf(stderr, "weight not found: %s\n", name);
+    return -1;
+}
+
+static int vox_adapter_load(vox_adapter_t *adapter, safetensors_file_t *sf) {
+    /* Adapter weights: try INT8, fall back to BF16 */
+    int r0 = load_weight_with_int8_fallback(sf,
+        "mm_streams_embeddings.embedding_module.audio_language_projection.0.weight",
+        &adapter->linear0_int8, &adapter->linear0_scale, &adapter->linear0_weight_bf16);
+    int r1 = load_weight_with_int8_fallback(sf,
+        "mm_streams_embeddings.embedding_module.audio_language_projection.2.weight",
+        &adapter->linear1_int8, &adapter->linear1_scale, &adapter->linear1_weight_bf16);
+
+    if (r0 < 0 || r1 < 0) return -1;
     return 0;
 }
 

@@ -64,6 +64,7 @@ static safetensor_dtype_t parse_dtype(const char *s) {
     if (strcmp(s, "I32") == 0) return DTYPE_I32;
     if (strcmp(s, "I64") == 0) return DTYPE_I64;
     if (strcmp(s, "BOOL") == 0) return DTYPE_BOOL;
+    if (strcmp(s, "I8") == 0) return DTYPE_I8;
     return DTYPE_UNKNOWN;
 }
 
@@ -400,6 +401,47 @@ int safetensor_is_bf16(const safetensor_t *t) {
     return t && t->dtype == DTYPE_BF16;
 }
 
+int safetensor_is_int8(const safetensor_t *t) {
+    return t && t->dtype == DTYPE_I8;
+}
+
+const int8_t *safetensors_get_int8_direct(const safetensors_file_t *sf,
+                                           const safetensor_t *t,
+                                           int64_t *count) {
+    if (!sf || !t) return NULL;
+    if (t->dtype != DTYPE_I8) return NULL;
+
+    int64_t n = safetensor_numel(t);
+    if ((size_t)n > t->data_size) return NULL;  /* INT8 = 1 byte per element */
+
+    if (count) *count = n;
+    return (const int8_t *)safetensors_data(sf, t);
+}
+
+float safetensors_get_scale(const safetensors_file_t *sf, const char *tensor_name) {
+    char scale_name[280];
+    snprintf(scale_name, sizeof(scale_name), "%s_scale", tensor_name);
+
+    const safetensor_t *scale_tensor = safetensors_find(sf, scale_name);
+    if (!scale_tensor) return 1.0f;
+
+    if (scale_tensor->dtype != DTYPE_F32) {
+        fprintf(stderr, "safetensors_get_scale: %s is not F32\n", scale_name);
+        return -1.0f;
+    }
+
+    int64_t n = safetensor_numel(scale_tensor);
+    if (n != 1) {
+        fprintf(stderr, "safetensors_get_scale: %s has %lld elements (expected 1)\n",
+                scale_name, (long long)n);
+        return -1.0f;
+    }
+
+    /* Scale is a single F32 value (per-tensor quantization). */
+    const float *data = (const float *)safetensors_data(sf, scale_tensor);
+    return data ? *data : 1.0f;
+}
+
 uint16_t *safetensors_get_bf16(const safetensors_file_t *sf, const safetensor_t *t) {
     if (!sf || !t) return NULL;
 
@@ -429,8 +471,8 @@ uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safete
 }
 
 void safetensor_print(const safetensor_t *t) {
-    const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL"};
-    const char *dtype_name = t->dtype >= 0 && t->dtype <= 5 ?
+    const char *dtype_names[] = {"F32", "F16", "BF16", "I32", "I64", "BOOL", "I8"};
+    const char *dtype_name = t->dtype >= 0 && t->dtype <= 6 ?
                              dtype_names[t->dtype] : "UNKNOWN";
 
     printf("%s: dtype=%s, shape=[", t->name, dtype_name);

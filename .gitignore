@@ -1,6 +1,8 @@
 voxtral_shaders_source.h
 voxtral
+quantize_int8
 voxtral-model/
+voxtral-model-q8/
 pyenv*/
 misc/
 *.o

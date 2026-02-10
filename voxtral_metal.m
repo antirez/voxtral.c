@@ -52,6 +52,12 @@ static id<MTLComputePipelineState> g_batched_kv_cache_copy_pipeline = nil;
 static id<MTLComputePipelineState> g_deinterleave_pipeline = nil;
 static id<MTLComputePipelineState> g_silu_mul_merged_pipeline = nil;
 
+/* INT8 GEMV/GEMM pipelines for quantized weight inference */
+static id<MTLComputePipelineState> g_int8_gemv_pipeline = nil;
+static id<MTLComputePipelineState> g_int8_gemm_pipeline = nil;
+static id<MTLComputePipelineState> g_int8_gemm_qkv_pipeline = nil;
+static id<MTLComputePipelineState> g_int8_gemm_w1w3_pipeline = nil;
+
 /* GPU-shared memory tracking (zero-copy between CPU and GPU) */
 #define SHARED_ALLOC_MAX 8
 static struct { void *ptr; id<MTLBuffer> buf; } g_shared_allocs[SHARED_ALLOC_MAX];
@@ -81,6 +87,7 @@ static inline uint16_t bf16_to_f16(uint16_t bf16) {
 
 /* ========================================================================
  * F16 Weight Cache (bf16 converted to f16, cached by CPU pointer)
+ * MPS requires F16 for mixed-precision matmul (F32×F16→F32)
  * ======================================================================== */
 
 #define F16_WEIGHT_CACHE_SIZE 512
@@ -96,6 +103,8 @@ static int g_f16_cache_count = 0;
 static pthread_mutex_t g_f16_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size_t num_elements) {
+    if (!weights || num_elements == 0) return nil;
+
     pthread_mutex_lock(&g_f16_cache_mutex);
 
     for (int i = 0; i < g_f16_cache_count; i++) {
@@ -106,7 +115,7 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
         }
     }
 
-    /* Convert bf16 -> f16 */
+    /* Convert bf16 -> f16 (MPS requires F16 weights) */
     uint16_t *f16_data = (uint16_t *)malloc(num_elements * sizeof(uint16_t));
     if (!f16_data) {
         pthread_mutex_unlock(&g_f16_cache_mutex);
@@ -141,6 +150,64 @@ static void clear_f16_cache(void) {
     }
     g_f16_cache_count = 0;
     pthread_mutex_unlock(&g_f16_cache_mutex);
+}
+
+/* ========================================================================
+ * INT8 Weight Cache (quantized weights, cached by CPU pointer)
+ * For custom GEMV/GEMM kernels that dequantize in GPU registers.
+ * ======================================================================== */
+
+#define INT8_WEIGHT_CACHE_SIZE 512
+
+typedef struct {
+    const void *cpu_ptr;
+    id<MTLBuffer> gpu_buffer;
+    size_t num_elements;
+    float scale;
+} int8_cache_entry_t;
+
+static int8_cache_entry_t g_int8_cache[INT8_WEIGHT_CACHE_SIZE];
+static int g_int8_cache_count = 0;
+static pthread_mutex_t g_int8_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static id<MTLBuffer> get_cached_int8_buffer(const int8_t *weights, size_t num_elements, float *scale_out) {
+    pthread_mutex_lock(&g_int8_cache_mutex);
+
+    for (int i = 0; i < g_int8_cache_count; i++) {
+        if (g_int8_cache[i].cpu_ptr == weights) {
+            id<MTLBuffer> buf = g_int8_cache[i].gpu_buffer;
+            if (scale_out) *scale_out = g_int8_cache[i].scale;
+            pthread_mutex_unlock(&g_int8_cache_mutex);
+            return buf;
+        }
+    }
+
+    /* Upload INT8 weights directly (no conversion) */
+    size_t size = num_elements * sizeof(int8_t);
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:weights
+                                              length:size
+                                             options:MTLResourceStorageModeShared];
+
+    if (buf && g_int8_cache_count < INT8_WEIGHT_CACHE_SIZE) {
+        g_int8_cache[g_int8_cache_count].cpu_ptr = weights;
+        g_int8_cache[g_int8_cache_count].gpu_buffer = buf;
+        g_int8_cache[g_int8_cache_count].num_elements = num_elements;
+        g_int8_cache[g_int8_cache_count].scale = scale_out ? *scale_out : 1.0f;
+        g_int8_cache_count++;
+    }
+
+    pthread_mutex_unlock(&g_int8_cache_mutex);
+    return buf;
+}
+
+static void clear_int8_cache(void) {
+    pthread_mutex_lock(&g_int8_cache_mutex);
+    for (int i = 0; i < g_int8_cache_count; i++) {
+        g_int8_cache[i].gpu_buffer = nil;
+        g_int8_cache[i].cpu_ptr = NULL;
+    }
+    g_int8_cache_count = 0;
+    pthread_mutex_unlock(&g_int8_cache_mutex);
 }
 
 /* ========================================================================
@@ -487,16 +554,40 @@ static int init_shaders(void) {
         func = [g_shader_library newFunctionWithName:@"silu_mul_merged"];
         if (func) g_silu_mul_merged_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
 
+        func = [g_shader_library newFunctionWithName:@"int8_gemv"];
+        if (func) {
+            g_int8_gemv_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"int8_gemm"];
+        if (func) {
+            g_int8_gemm_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"int8_gemm_qkv"];
+        if (func) {
+            g_int8_gemm_qkv_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"int8_gemm_w1w3"];
+        if (func) {
+            g_int8_gemm_w1w3_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
         g_shaders_initialized = 1;
 
         if (vox_verbose >= 2) {
-            fprintf(stderr, "Metal: compute shaders compiled (%s%s%s%s%s%s)\n",
+            fprintf(stderr, "Metal: compute shaders compiled (%s%s%s%s%s%s%s%s%s%s)\n",
                     g_rms_norm_pipeline ? "rms_norm " : "",
                     g_silu_pipeline ? "silu " : "",
                     g_gelu_pipeline ? "gelu " : "",
                     g_add_inplace_pipeline ? "add " : "",
                     g_mul_inplace_pipeline ? "mul " : "",
-                    g_causal_softmax_pipeline ? "causal_softmax " : "");
+                    g_causal_softmax_pipeline ? "causal_softmax " : "",
+                    g_int8_gemv_pipeline ? "int8_gemv " : "",
+                    g_int8_gemm_pipeline ? "int8_gemm " : "",
+                    g_int8_gemm_qkv_pipeline ? "int8_gemm_qkv " : "",
+                    g_int8_gemm_w1w3_pipeline ? "int8_gemm_w1w3 " : "");
         }
     }
 
@@ -547,6 +638,7 @@ void vox_metal_shutdown(void) {
 
     @autoreleasepool {
         clear_f16_cache();
+        clear_int8_cache();
         clear_merged_cache();
         clear_weight_cache();
         clear_activation_pool();
@@ -1559,6 +1651,371 @@ void vox_metal_decoder_end(void) {
     /* Keep g_dec_x allocated for reuse across tokens */
 }
 
+/* ========================================================================
+ * INT8 GEMV dispatch helper: y[N] = x[K] @ W[K,N] where W is INT8.
+ * Dispatches the custom int8_gemv compute kernel.
+ * ======================================================================== */
+static void encode_int8_gemv(id<MTLComputeCommandEncoder> enc,
+                              id<MTLBuffer> bufX,        /* Input: [K] */
+                              id<MTLBuffer> bufW,        /* Weights: [K, N] INT8 */
+                              id<MTLBuffer> bufY,        /* Output: [N] */
+                              float scale,
+                              int K, int N) {
+    if (!g_int8_gemv_pipeline) return;
+
+    [enc setComputePipelineState:g_int8_gemv_pipeline];
+    [enc setBuffer:bufX offset:0 atIndex:0];
+    [enc setBuffer:bufW offset:0 atIndex:1];
+    [enc setBuffer:bufY offset:0 atIndex:2];
+    [enc setBytes:&scale length:sizeof(float) atIndex:3];
+    [enc setBytes:&K length:sizeof(int) atIndex:4];
+    [enc setBytes:&N length:sizeof(int) atIndex:5];
+
+    /* Grid: ceil(N / GEMV_TILE_N) threadgroups, 512 threads each */
+    int tile_n = 4;  /* GEMV_TILE_N from shader */
+    int n_groups = (N + tile_n - 1) / tile_n;
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_groups, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+}
+
+static void encode_int8_gemv_at_offset(id<MTLComputeCommandEncoder> enc,
+                                       id<MTLBuffer> bufX,        /* Input: [K] */
+                                       id<MTLBuffer> bufW,        /* Weights: [K, N] INT8 */
+                                       id<MTLBuffer> bufY,        /* Output: [N] */
+                                       size_t y_offset_bytes,
+                                       float scale,
+                                       int K, int N) {
+    if (!g_int8_gemv_pipeline) return;
+
+    [enc setComputePipelineState:g_int8_gemv_pipeline];
+    [enc setBuffer:bufX offset:0 atIndex:0];
+    [enc setBuffer:bufW offset:0 atIndex:1];
+    [enc setBuffer:bufY offset:y_offset_bytes atIndex:2];
+    [enc setBytes:&scale length:sizeof(float) atIndex:3];
+    [enc setBytes:&K length:sizeof(int) atIndex:4];
+    [enc setBytes:&N length:sizeof(int) atIndex:5];
+
+    int tile_n = 4;  /* GEMV_TILE_N from shader */
+    int n_groups = (N + tile_n - 1) / tile_n;
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_groups, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+}
+
+/* INT8 GEMM dispatch helper: C[M,N] = A[M,K] @ W[N,K]^T (W is INT8).
+ * Uses the custom int8_gemm kernel (tile: 8x32x32). */
+static void encode_int8_gemm(id<MTLComputeCommandEncoder> enc,
+                              id<MTLBuffer> bufA,        /* Input: [M, K] */
+                              id<MTLBuffer> bufW,        /* Weights: [N, K] INT8 */
+                              id<MTLBuffer> bufC,        /* Output: [M, N] */
+                              float scale,
+                              int M, int K, int N) {
+    if (!g_int8_gemm_pipeline) return;
+
+    [enc setComputePipelineState:g_int8_gemm_pipeline];
+    [enc setBuffer:bufA offset:0 atIndex:0];
+    [enc setBuffer:bufW offset:0 atIndex:1];
+    [enc setBuffer:bufC offset:0 atIndex:2];
+    [enc setBytes:&scale length:sizeof(float) atIndex:3];
+    [enc setBytes:&M length:sizeof(int) atIndex:4];
+    [enc setBytes:&K length:sizeof(int) atIndex:5];
+    [enc setBytes:&N length:sizeof(int) atIndex:6];
+
+    int tile_m = 8;   /* TILE_M from shader */
+    int tile_n = 32;  /* TILE_N from shader */
+    int groups_x = (N + tile_n - 1) / tile_n;
+    int groups_y = (M + tile_m - 1) / tile_m;
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups_x, (NSUInteger)groups_y, 1)
+       threadsPerThreadgroup:MTLSizeMake((NSUInteger)tile_n, (NSUInteger)tile_m, 1)];
+}
+
+/* Fused INT8 GEMM for decoder QKV prefill: writes directly to Q/K/V buffers. */
+static void encode_int8_gemm_qkv(id<MTLComputeCommandEncoder> enc,
+                                  id<MTLBuffer> bufA,        /* Input: [M, K] */
+                                  id<MTLBuffer> bufWq,       /* Weights: [Nq, K] INT8 */
+                                  id<MTLBuffer> bufWk,       /* Weights: [Nk, K] INT8 */
+                                  id<MTLBuffer> bufWv,       /* Weights: [Nv, K] INT8 */
+                                  id<MTLBuffer> bufQ,        /* Output: [M, Nq] */
+                                  id<MTLBuffer> bufK,        /* Output: [M, Nk] */
+                                  id<MTLBuffer> bufV,        /* Output: [M, Nv] */
+                                  float wq_scale,
+                                  float wk_scale,
+                                  float wv_scale,
+                                  int M, int Kdim, int Nq, int Nk, int Nv) {
+    if (!g_int8_gemm_qkv_pipeline) return;
+
+    [enc setComputePipelineState:g_int8_gemm_qkv_pipeline];
+    [enc setBuffer:bufA offset:0 atIndex:0];
+    [enc setBuffer:bufWq offset:0 atIndex:1];
+    [enc setBuffer:bufWk offset:0 atIndex:2];
+    [enc setBuffer:bufWv offset:0 atIndex:3];
+    [enc setBuffer:bufQ offset:0 atIndex:4];
+    [enc setBuffer:bufK offset:0 atIndex:5];
+    [enc setBuffer:bufV offset:0 atIndex:6];
+    [enc setBytes:&wq_scale length:sizeof(float) atIndex:7];
+    [enc setBytes:&wk_scale length:sizeof(float) atIndex:8];
+    [enc setBytes:&wv_scale length:sizeof(float) atIndex:9];
+    [enc setBytes:&M length:sizeof(int) atIndex:10];
+    [enc setBytes:&Kdim length:sizeof(int) atIndex:11];
+    [enc setBytes:&Nq length:sizeof(int) atIndex:12];
+    [enc setBytes:&Nk length:sizeof(int) atIndex:13];
+    [enc setBytes:&Nv length:sizeof(int) atIndex:14];
+
+    int tile_m = 8;
+    int tile_n = 32;
+    int Ntotal = Nq + Nk + Nv;
+    int groups_x = (Ntotal + tile_n - 1) / tile_n;
+    int groups_y = (M + tile_m - 1) / tile_m;
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups_x, (NSUInteger)groups_y, 1)
+       threadsPerThreadgroup:MTLSizeMake((NSUInteger)tile_n, (NSUInteger)tile_m, 1)];
+}
+
+/* Fused INT8 GEMM for decoder FFN W1+W3 prefill: outputs interleaved [gate, up]. */
+static void encode_int8_gemm_w1w3(id<MTLComputeCommandEncoder> enc,
+                                  id<MTLBuffer> bufA,        /* Input: [M, K] */
+                                  id<MTLBuffer> bufW1,       /* Weights: [hidden, K] INT8 */
+                                  id<MTLBuffer> bufW3,       /* Weights: [hidden, K] INT8 */
+                                  id<MTLBuffer> bufC,        /* Output: [M, 2*hidden] */
+                                  float w1_scale,
+                                  float w3_scale,
+                                  int M, int Kdim, int hidden) {
+    if (!g_int8_gemm_w1w3_pipeline) return;
+
+    [enc setComputePipelineState:g_int8_gemm_w1w3_pipeline];
+    [enc setBuffer:bufA offset:0 atIndex:0];
+    [enc setBuffer:bufW1 offset:0 atIndex:1];
+    [enc setBuffer:bufW3 offset:0 atIndex:2];
+    [enc setBuffer:bufC offset:0 atIndex:3];
+    [enc setBytes:&w1_scale length:sizeof(float) atIndex:4];
+    [enc setBytes:&w3_scale length:sizeof(float) atIndex:5];
+    [enc setBytes:&M length:sizeof(int) atIndex:6];
+    [enc setBytes:&Kdim length:sizeof(int) atIndex:7];
+    [enc setBytes:&hidden length:sizeof(int) atIndex:8];
+
+    int tile_m = 8;
+    int tile_n = 32;
+    int Ntotal = hidden * 2;
+    int groups_x = (Ntotal + tile_n - 1) / tile_n;
+    int groups_y = (M + tile_m - 1) / tile_m;
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups_x, (NSUInteger)groups_y, 1)
+       threadsPerThreadgroup:MTLSizeMake((NSUInteger)tile_n, (NSUInteger)tile_m, 1)];
+}
+
+/* INT8 version of encode_norm_qkv_steps: RMSNorm + 3 separate INT8 GEMV calls. */
+static void encode_norm_qkv_steps_int8(id<MTLCommandBuffer> cmdBuffer,
+                                        id<MTLBuffer> bufXnorm,
+                                        id<MTLBuffer> bufQKV,
+                                        int K,
+                                        const float *norm_weight, float eps,
+                                        const int8_t *wq_int8, float wq_scale, int Nq,
+                                        const int8_t *wk_int8, float wk_scale, int Nk,
+                                        const int8_t *wv_int8, float wv_scale, int Nv) {
+    id<MTLBuffer> bufNorm = get_cached_weight_buffer(norm_weight, K * sizeof(float));
+
+    /* Get cached INT8 weight buffers */
+    id<MTLBuffer> bufWq = get_cached_int8_buffer(wq_int8, (size_t)Nq * K, NULL);
+    id<MTLBuffer> bufWk = get_cached_int8_buffer(wk_int8, (size_t)Nk * K, NULL);
+    id<MTLBuffer> bufWv = get_cached_int8_buffer(wv_int8, (size_t)Nv * K, NULL);
+
+    if (!bufWq || !bufWk || !bufWv) return;
+
+    /* rms_norm(g_dec_x, norm_weight) → bufXnorm */
+    {
+        int M = 1;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufNorm offset:0 atIndex:1];
+        [enc setBuffer:bufXnorm offset:0 atIndex:2];
+        int hidden = K;
+        [enc setBytes:&hidden length:sizeof(int) atIndex:3];
+        [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+    }
+
+    /* QKV projections using INT8 GEMV: 3 separate calls */
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+
+        /* Q = x_norm @ Wq^T */
+        encode_int8_gemv(enc, bufXnorm, bufWq, bufQKV, wq_scale, K, Nq);
+
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        /* K = x_norm @ Wk^T (at offset Nq in bufQKV) */
+        size_t off_k = (size_t)Nq * sizeof(float);
+        encode_int8_gemv_at_offset(enc, bufXnorm, bufWk, bufQKV, off_k, wk_scale, K, Nk);
+
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        /* V = x_norm @ Wv^T (at offset Nq+Nk in bufQKV) */
+        size_t off_v = (size_t)(Nq + Nk) * sizeof(float);
+        encode_int8_gemv_at_offset(enc, bufXnorm, bufWv, bufQKV, off_v, wv_scale, K, Nv);
+
+        [enc endEncoding];
+    }
+}
+
+/* INT8 version of encode_wo_ffn_steps: INT8 GEMV for wo, w1, w3; BF16 for w2.
+ * w2 is kept at BF16 for accuracy (output magnitude critical per plan). */
+static void encode_wo_ffn_steps_int8(id<MTLCommandBuffer> cmdBuffer,
+                                      id<MTLBuffer> bufAttn,
+                                      id<MTLBuffer> bufProj,
+                                      id<MTLBuffer> bufXnorm,
+                                      id<MTLBuffer> bufGate, /* must hold hidden*2 floats */
+                                      id<MTLBuffer> bufFfnOut,
+                                      int dim, int q_dim, int hidden,
+                                      const int8_t *wo_int8, float wo_scale,
+                                      const float *ffn_norm, float eps,
+                                      const float *ada_scale,
+                                      const int8_t *w1_int8, float w1_scale,
+                                      const int8_t *w3_int8, float w3_scale,
+                                      const uint16_t *w2_bf16) {
+    int M = 1;
+
+    /* Get cached INT8 weight buffers */
+    id<MTLBuffer> bufWo = get_cached_int8_buffer(wo_int8, (size_t)dim * q_dim, NULL);
+    id<MTLBuffer> bufW1 = get_cached_int8_buffer(w1_int8, (size_t)hidden * dim, NULL);
+    id<MTLBuffer> bufW3 = get_cached_int8_buffer(w3_int8, (size_t)hidden * dim, NULL);
+    id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(w2_bf16, (size_t)dim * hidden);
+    id<MTLBuffer> bufNorm = get_cached_weight_buffer(ffn_norm, dim * sizeof(float));
+    id<MTLBuffer> bufAda = ada_scale ?
+        get_cached_weight_buffer(ada_scale, dim * sizeof(float)) : nil;
+
+    if (!bufWo || !bufW1 || !bufW3 || !bufW2) return;
+
+    /* Step 1: proj = attn_out @ wo^T (INT8 GEMV) */
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        encode_int8_gemv(enc, bufAttn, bufWo, bufProj, wo_scale, q_dim, dim);
+        [enc endEncoding];
+    }
+
+    /* Steps 2+3+4: x += proj, x_norm = rms_norm(x), x_norm *= (1+ada_scale) */
+    {
+        int n = M * dim;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+
+        /* x += proj */
+        [enc setComputePipelineState:g_add_inplace_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufProj offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_add_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        /* x_norm = rms_norm(x, ffn_norm) */
+        [enc setComputePipelineState:g_rms_norm_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufNorm offset:0 atIndex:1];
+        [enc setBuffer:bufXnorm offset:0 atIndex:2];
+        [enc setBytes:&dim length:sizeof(int) atIndex:3];
+        [enc setBytes:&eps length:sizeof(float) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)M, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        /* x_norm *= (1 + ada_scale) */
+        if (bufAda) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:g_ada_scale_mul_pipeline];
+            [enc setBuffer:bufXnorm offset:0 atIndex:0];
+            [enc setBuffer:bufAda offset:0 atIndex:1];
+            [enc setBytes:&n length:sizeof(int) atIndex:2];
+            [enc setBytes:&dim length:sizeof(int) atIndex:3];
+            tgSize = MIN((NSUInteger)n, g_ada_scale_mul_pipeline.maxTotalThreadsPerThreadgroup);
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        }
+
+        [enc endEncoding];
+    }
+
+    /* Steps 5+6: gate = x_norm @ w1^T, up = x_norm @ w3^T (INT8 GEMV, separate) */
+    {
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+
+        /* gate = x_norm @ w1^T at bufGate offset 0 */
+        encode_int8_gemv(enc, bufXnorm, bufW1, bufGate, w1_scale, dim, hidden);
+
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        /* up = x_norm @ w3^T at bufGate offset hidden */
+        size_t up_offset = (size_t)hidden * sizeof(float);
+        encode_int8_gemv_at_offset(enc, bufXnorm, bufW3, bufGate, up_offset, w3_scale, dim, hidden);
+
+        [enc endEncoding];
+    }
+
+    /* Steps 7+8: silu(gate), gate *= up */
+    {
+        int n = M * hidden;
+        size_t up_offset = (size_t)hidden * sizeof(float);
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+
+        /* silu on gate portion [0:hidden] */
+        [enc setComputePipelineState:g_silu_pipeline];
+        [enc setBuffer:bufGate offset:0 atIndex:0];
+        [enc setBytes:&n length:sizeof(int) atIndex:1];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_silu_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        /* gate[0:hidden] *= up[hidden:hidden*2] */
+        [enc setComputePipelineState:g_mul_inplace_pipeline];
+        [enc setBuffer:bufGate offset:0 atIndex:0];
+        [enc setBuffer:bufGate offset:up_offset atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        tgSize = MIN((NSUInteger)n, g_mul_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+
+        [enc endEncoding];
+    }
+
+    /* Step 9: ffn_out = gate @ w2^T (BF16 via MPS - kept for accuracy) */
+    {
+        MPSMatrixDescriptor *descH = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:hidden
+                            rowBytes:hidden * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:dim columns:hidden
+                            rowBytes:hidden * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:dim
+                            rowBytes:dim * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+        MPSMatrix *matGate = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descH];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW2 descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufFfnOut descriptor:descOut];
+        MPSMatrixMultiplication *mm =
+            get_cached_matmul_op(NO, YES, M, dim, hidden, 1.0, 0.0);
+        if (mm)
+            [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matGate rightMatrix:matW resultMatrix:matOut];
+    }
+
+    /* Step 10: x += ffn_out */
+    {
+        int n = M * dim;
+        id<MTLComputeCommandEncoder> enc = [cmdBuffer computeCommandEncoder];
+        [enc setComputePipelineState:g_add_inplace_pipeline];
+        [enc setBuffer:g_dec_x offset:0 atIndex:0];
+        [enc setBuffer:bufFfnOut offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(int) atIndex:2];
+        NSUInteger tgSize = MIN((NSUInteger)n, g_add_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        [enc endEncoding];
+    }
+}
+
 /* Helper: encode wo+FFN steps into a command buffer (steps 1-10).
  * Reads attn_out from bufAttn, updates g_dec_x in-place.
  * Returns bufXnorm (output of FFN rms_norm, needed for next step).
@@ -2393,21 +2850,41 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                 const float *ada_s = ctx->ada_scale ?
                     ctx->ada_scale + (size_t)(layer - 1) * dim : NULL;
 
-                encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
-                                    bufGate, bufFfnOut,
-                                    dim, q_dim, hidden,
-                                    prev->wo_weight_bf16,
-                                    prev->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
-                                    prev->w1_weight_bf16, prev->w3_weight_bf16,
-                                    prev->w2_weight_bf16);
+                /* Use INT8 path if available */
+                if (prev->wo_int8 && prev->w1_int8 && prev->w3_int8) {
+                    encode_wo_ffn_steps_int8(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                                              bufGate, bufFfnOut,
+                                              dim, q_dim, hidden,
+                                              prev->wo_int8, prev->wo_scale,
+                                              prev->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                                              prev->w1_int8, prev->w1_scale,
+                                              prev->w3_int8, prev->w3_scale,
+                                              prev->w2_weight_bf16);
+                } else {
+                    encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                                        bufGate, bufFfnOut,
+                                        dim, q_dim, hidden,
+                                        prev->wo_weight_bf16,
+                                        prev->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                                        prev->w1_weight_bf16, prev->w3_weight_bf16,
+                                        prev->w2_weight_bf16);
+                }
             }
 
-            /* RMSNorm + QKV projections (merged into single matmul) */
-            encode_norm_qkv_steps(cmdBuffer, bufXnorm, bufQKV,
-                                  dim, l->attention_norm, VOX_DEC_NORM_EPS,
-                                  l->wq_weight_bf16, q_dim,
-                                  l->wk_weight_bf16, kv_dim,
-                                  l->wv_weight_bf16, kv_dim);
+            /* RMSNorm + QKV projections */
+            if (l->wq_int8 && l->wk_int8 && l->wv_int8) {
+                encode_norm_qkv_steps_int8(cmdBuffer, bufXnorm, bufQKV,
+                                            dim, l->attention_norm, VOX_DEC_NORM_EPS,
+                                            l->wq_int8, l->wq_scale, q_dim,
+                                            l->wk_int8, l->wk_scale, kv_dim,
+                                            l->wv_int8, l->wv_scale, kv_dim);
+            } else {
+                encode_norm_qkv_steps(cmdBuffer, bufXnorm, bufQKV,
+                                      dim, l->attention_norm, VOX_DEC_NORM_EPS,
+                                      l->wq_weight_bf16, q_dim,
+                                      l->wk_weight_bf16, kv_dim,
+                                      l->wv_weight_bf16, kv_dim);
+            }
 
             /* RoPE + KV cache write + attention in single compute encoder.
              * bufQKV layout: [Q (q_dim), K (kv_dim), V (kv_dim)] */
@@ -2415,7 +2892,8 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                 int kv_offset = (int)((size_t)layer * ctx->kv_cache_max + pos) * kv_dim;
                 size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * sizeof(float);
                 int window = VOX_DEC_WINDOW;
-                int q_pos_val = ctx->kv_pos_offset + pos;
+                /* Attention masking/windowing uses physical positions in the KV cache. */
+                int q_pos_val = pos;
                 size_t off_k = (size_t)q_dim * sizeof(float);
                 size_t off_v = (size_t)(q_dim + kv_dim) * sizeof(float);
 
@@ -2500,13 +2978,25 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
             const float *ada_s = ctx->ada_scale ?
                 ctx->ada_scale + (size_t)(VOX_DEC_LAYERS - 1) * dim : NULL;
 
-            encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
-                                bufGate, bufFfnOut,
-                                dim, q_dim, hidden,
-                                last->wo_weight_bf16,
-                                last->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
-                                last->w1_weight_bf16, last->w3_weight_bf16,
-                                last->w2_weight_bf16);
+            /* Use INT8 path if available */
+            if (last->wo_int8 && last->w1_int8 && last->w3_int8) {
+                encode_wo_ffn_steps_int8(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                                          bufGate, bufFfnOut,
+                                          dim, q_dim, hidden,
+                                          last->wo_int8, last->wo_scale,
+                                          last->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                                          last->w1_int8, last->w1_scale,
+                                          last->w3_int8, last->w3_scale,
+                                          last->w2_weight_bf16);
+            } else {
+                encode_wo_ffn_steps(cmdBuffer, bufAttn, bufProj, bufXnorm,
+                                    bufGate, bufFfnOut,
+                                    dim, q_dim, hidden,
+                                    last->wo_weight_bf16,
+                                    last->ffn_norm, VOX_DEC_NORM_EPS, ada_s,
+                                    last->w1_weight_bf16, last->w3_weight_bf16,
+                                    last->w2_weight_bf16);
+            }
 
             /* Final RMSNorm */
             id<MTLBuffer> bufFinalNorm = get_cached_weight_buffer(dec->norm,
@@ -2657,6 +3147,16 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
 
         uint64_t enc_t0 = mach_absolute_time();
 
+        /* Detect INT8 weights (check layer 0 — all layers use same format) */
+        vox_enc_layer_t *l0 = &enc->layers[0];
+        int use_int8 = (l0->wq_int8 && l0->wk_int8 && l0->wv_int8 &&
+                        l0->wo_int8 && l0->w1_int8 && l0->w3_int8);
+        if (use_int8) {
+            if (!g_int8_gemm_pipeline) use_int8 = 0;
+            if (!g_int8_gemm_qkv_pipeline) use_int8 = 0;
+            if (!g_int8_gemm_w1w3_pipeline) use_int8 = 0;
+        }
+
         /* ---- 32 encoder layers ---- */
         for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
             vox_enc_layer_t *l = &enc->layers[layer];
@@ -2678,8 +3178,22 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
                 [enc_cmd endEncoding];
             }
 
-            /* Step 2: Merged QKV projection (1 matmul + deinterleave) */
-            {
+            /* Step 2: QKV projection */
+            if (use_int8) {
+                /* INT8: int8_gemm_qkv outputs directly to Q, K, V (no deinterleave) */
+                id<MTLBuffer> bufWq = get_cached_int8_buffer(l->wq_int8, (size_t)qkv_dim * dim, NULL);
+                id<MTLBuffer> bufWk = get_cached_int8_buffer(l->wk_int8, (size_t)kv_dim * dim, NULL);
+                id<MTLBuffer> bufWv = get_cached_int8_buffer(l->wv_int8, (size_t)kv_dim * dim, NULL);
+
+                id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                encode_int8_gemm_qkv(enc_cmd,
+                                     bufXnorm, bufWq, bufWk, bufWv,
+                                     bufQ, bufK, bufV,
+                                     l->wq_scale, l->wk_scale, l->wv_scale,
+                                     M, dim, qkv_dim, kv_dim, kv_dim);
+                [enc_cmd endEncoding];
+            } else {
+                /* BF16: Merged matmul + deinterleave */
                 id<MTLBuffer> bufWqkv = get_merged_f16_3(
                     l->wq_weight_bf16, (size_t)qkv_dim * dim,
                     l->wk_weight_bf16, (size_t)kv_dim * dim,
@@ -2865,7 +3379,12 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
             }
 
             /* Step 4: wo projection */
-            {
+            if (use_int8) {
+                id<MTLBuffer> bufWo = get_cached_int8_buffer(l->wo_int8, (size_t)dim * qkv_dim, NULL);
+                id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                encode_int8_gemm(enc_cmd, bufAttn, bufWo, bufProj, l->wo_scale, M, qkv_dim, dim);
+                [enc_cmd endEncoding];
+            } else {
                 id<MTLBuffer> bufWo = get_cached_bf16_as_f16_buffer(l->wo_weight_bf16,
                                             (size_t)dim * qkv_dim);
                 MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
@@ -2943,18 +3462,25 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
                 [enc_cmd endEncoding];
             }
 
-            /* Step 6: Merged FFN (1 matmul for w1+w3, fused silu*mul, strided w2) */
+            /* Step 6: Merged FFN (w1+w3 matmul, fused silu*mul, w2 matmul + bias) */
             {
-                id<MTLBuffer> bufW1W3 = get_merged_f16_2(
-                    l->w1_weight_bf16, (size_t)hidden * dim,
-                    l->w3_weight_bf16, (size_t)hidden * dim);
                 id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(l->w2_weight_bf16,
                                             (size_t)dim * hidden);
                 id<MTLBuffer> bufW2Bias = get_cached_weight_buffer(l->w2_bias,
                                             dim * sizeof(float));
 
                 /* [gate; up] = x_norm @ [w1; w3]^T → bufGate [M, hidden*2] */
-                {
+                if (use_int8) {
+                    id<MTLBuffer> bufW1 = get_cached_int8_buffer(l->w1_int8, (size_t)hidden * dim, NULL);
+                    id<MTLBuffer> bufW3 = get_cached_int8_buffer(l->w3_int8, (size_t)hidden * dim, NULL);
+                    id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                    encode_int8_gemm_w1w3(enc_cmd, bufXnorm, bufW1, bufW3, bufGate,
+                                          l->w1_scale, l->w3_scale, M, dim, hidden);
+                    [enc_cmd endEncoding];
+                } else {
+                    id<MTLBuffer> bufW1W3 = get_merged_f16_2(
+                        l->w1_weight_bf16, (size_t)hidden * dim,
+                        l->w3_weight_bf16, (size_t)hidden * dim);
                     MPSMatrixDescriptor *descIn = [MPSMatrixDescriptor
                         matrixDescriptorWithRows:M columns:dim
                                         rowBytes:dim * sizeof(float)
@@ -3108,12 +3634,29 @@ int vox_metal_encoder_full_step(void *ctx_ptr, float *x, int new_len,
  * Monolithic Decoder Prefill: all 26 layers in ONE command buffer (M>1)
  * ======================================================================== */
 
-void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
-                                      const float *rope_freqs) {
-    if (!g_initialized || !g_shaders_initialized) return;
+int vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
+                                    const float *rope_freqs) {
+    if (!g_initialized || !g_shaders_initialized) return 0;
 
     vox_ctx_t *ctx = (vox_ctx_t *)ctx_ptr;
     vox_decoder_t *dec = &ctx->decoder;
+
+    /* Prefill supports BF16 (MPS) and INT8 (custom GEMM). */
+    int use_int8 = (dec->layers[0].wq_int8 && dec->layers[0].wk_int8 && dec->layers[0].wv_int8 &&
+                    dec->layers[0].wo_int8 && dec->layers[0].w1_int8 && dec->layers[0].w3_int8);
+    if (use_int8) {
+        if (!g_int8_gemm_pipeline) return 0;          /* wo projection */
+        if (!g_int8_gemm_qkv_pipeline) return 0;      /* fused QKV */
+        if (!g_int8_gemm_w1w3_pipeline) return 0;     /* fused W1+W3 */
+        if (!g_silu_mul_merged_pipeline) return 0;    /* fused SiLU*mul */
+    } else {
+        /* BF16 path requires BF16 QKV weights. */
+        if (dec->layers[0].wq_weight_bf16 == NULL ||
+            dec->layers[0].wk_weight_bf16 == NULL ||
+            dec->layers[0].wv_weight_bf16 == NULL) {
+            return 0;
+        }
+    }
 
     int dim = VOX_DEC_DIM;          /* 3072 */
     int n_heads = VOX_DEC_HEADS;    /* 32 */
@@ -3131,7 +3674,9 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
     /* Find GPU buffer handles for decoder KV cache */
     id<MTLBuffer> gpu_kv_k = find_shared_buffer(ctx->kv_cache_k);
     id<MTLBuffer> gpu_kv_v = find_shared_buffer(ctx->kv_cache_v);
-    if (!gpu_kv_k || !gpu_kv_v) return;
+    if (!gpu_kv_k || !gpu_kv_v) return 0;
+
+    int success = 0;
 
     @autoreleasepool {
         /* Scratch buffers */
@@ -3167,10 +3712,11 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
             pool_release_buffer(bufGate);
             pool_release_buffer(bufFfnOut);
             pool_release_buffer(bufRope);
-            return;
+            return 0;
         }
 
         id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        int ok = 1;
 
         /* ---- 26 decoder layers ---- */
         for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
@@ -3193,8 +3739,24 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
                 [enc_cmd endEncoding];
             }
 
-            /* Step 2: Merged QKV projection (1 matmul + deinterleave) */
-            {
+            /* Step 2: QKV projection */
+            if (use_int8) {
+                /* INT8: fused QKV GEMM into Q/K/V (single dispatch). */
+                id<MTLBuffer> bufWq = get_cached_int8_buffer(l->wq_int8, (size_t)q_dim * dim, NULL);
+                id<MTLBuffer> bufWk = get_cached_int8_buffer(l->wk_int8, (size_t)kv_dim * dim, NULL);
+                id<MTLBuffer> bufWv = get_cached_int8_buffer(l->wv_int8, (size_t)kv_dim * dim, NULL);
+
+                if (!bufWq || !bufWk || !bufWv) { ok = 0; break; }
+
+                id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                encode_int8_gemm_qkv(enc_cmd,
+                                      bufXnorm, bufWq, bufWk, bufWv,
+                                      bufQ, bufK, bufV,
+                                      l->wq_scale, l->wk_scale, l->wv_scale,
+                                      M, dim, q_dim, kv_dim, kv_dim);
+                [enc_cmd endEncoding];
+            } else {
+                /* BF16: merged QKV (1 matmul + deinterleave). */
                 id<MTLBuffer> bufWqkv = get_merged_f16_3(
                     l->wq_weight_bf16, (size_t)q_dim * dim,
                     l->wk_weight_bf16, (size_t)kv_dim * dim,
@@ -3317,7 +3879,8 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
                 [enc_cmd memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
                 /* Batched attention (using encoder_attention kernel with head_dim=128) */
-                int q_offset_val = ctx->kv_pos_offset + start_pos;
+                /* q_offset is physical (KV cache indices), not logical RoPE position. */
+                int q_offset_val = start_pos;
                 size_t layer_kv_offset = (size_t)layer * ctx->kv_cache_max * kv_dim * sizeof(float);
                 [enc_cmd setComputePipelineState:g_encoder_attention_pipeline];
                 [enc_cmd setBuffer:bufQ offset:0 atIndex:0];
@@ -3344,7 +3907,14 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
             }
 
             /* Step 4: wo projection */
-            {
+            if (use_int8) {
+                id<MTLBuffer> bufWo = get_cached_int8_buffer(l->wo_int8, (size_t)dim * q_dim, NULL);
+                if (!bufWo) { ok = 0; break; }
+
+                id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                encode_int8_gemm(enc_cmd, bufAttn, bufWo, bufProj, l->wo_scale, M, q_dim, dim);
+                [enc_cmd endEncoding];
+            } else {
                 id<MTLBuffer> bufWo = get_cached_bf16_as_f16_buffer(l->wo_weight_bf16,
                                             (size_t)dim * q_dim);
                 MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
@@ -3424,8 +3994,81 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
                 [enc_cmd endEncoding];
             }
 
-            /* Step 6: Merged FFN (1 matmul for w1+w3, fused silu*mul, strided w2) */
-            {
+            /* Step 6: FFN */
+            if (use_int8) {
+                /* INT8: fused w1+w3 GEMM into interleaved [gate, up], fused silu*mul, w2 via MPS. */
+                id<MTLBuffer> bufW1 = get_cached_int8_buffer(l->w1_int8, (size_t)hidden * dim, NULL);
+                id<MTLBuffer> bufW3 = get_cached_int8_buffer(l->w3_int8, (size_t)hidden * dim, NULL);
+                id<MTLBuffer> bufW2 = get_cached_bf16_as_f16_buffer(l->w2_weight_bf16,
+                                            (size_t)dim * hidden);
+
+                if (!bufW1 || !bufW3 || !bufW2) { ok = 0; break; }
+
+                /* [gate; up] = x_norm @ [w1; w3]^T → bufGate [M, hidden*2] */
+                {
+                    id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                    encode_int8_gemm_w1w3(enc_cmd,
+                                          bufXnorm, bufW1, bufW3, bufGate,
+                                          l->w1_scale, l->w3_scale,
+                                          M, dim, hidden);
+                    [enc_cmd endEncoding];
+                }
+
+                /* Fused silu + mul on interleaved [M, hidden*2] layout */
+                {
+                    int n_gate = M * hidden;
+                    id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                    [enc_cmd setComputePipelineState:g_silu_mul_merged_pipeline];
+                    [enc_cmd setBuffer:bufGate offset:0 atIndex:0];
+                    [enc_cmd setBytes:&hidden length:sizeof(int) atIndex:1];
+                    [enc_cmd setBytes:&n_gate length:sizeof(int) atIndex:2];
+                    NSUInteger tg = MIN((NSUInteger)n_gate,
+                                        g_silu_mul_merged_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n_gate, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    [enc_cmd endEncoding];
+                }
+
+                /* ffn_out = gate @ w2^T (strided read: rowBytes = hidden*2) */
+                {
+                    MPSMatrixDescriptor *descG = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:hidden
+                                        rowBytes:ffn_merged * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrixDescriptor *descW2 = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:dim columns:hidden
+                                        rowBytes:hidden * sizeof(uint16_t)
+                                        dataType:MPSDataTypeFloat16];
+                    MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                        matrixDescriptorWithRows:M columns:dim
+                                        rowBytes:dim * sizeof(float)
+                                        dataType:MPSDataTypeFloat32];
+                    MPSMatrix *matG = [[MPSMatrix alloc] initWithBuffer:bufGate descriptor:descG];
+                    MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW2 descriptor:descW2];
+                    MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:bufFfnOut descriptor:descOut];
+                    MPSMatrixMultiplication *mm =
+                        get_cached_matmul_op(NO, YES, M, dim, hidden, 1.0, 0.0);
+                    if (mm)
+                        [mm encodeToCommandBuffer:cmdBuffer leftMatrix:matG
+                                      rightMatrix:matW resultMatrix:matOut];
+                }
+
+                /* x += ffn_out */
+                {
+                    int n = M * dim;
+                    id<MTLComputeCommandEncoder> enc_cmd = [cmdBuffer computeCommandEncoder];
+                    [enc_cmd setComputePipelineState:g_add_inplace_pipeline];
+                    [enc_cmd setBuffer:bufX offset:0 atIndex:0];
+                    [enc_cmd setBuffer:bufFfnOut offset:0 atIndex:1];
+                    [enc_cmd setBytes:&n length:sizeof(int) atIndex:2];
+                    NSUInteger tg = MIN((NSUInteger)n,
+                                        g_add_inplace_pipeline.maxTotalThreadsPerThreadgroup);
+                    [enc_cmd dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                    [enc_cmd endEncoding];
+                }
+            } else {
+                /* BF16: merged FFN (1 matmul for w1+w3, fused silu*mul, strided w2). */
                 id<MTLBuffer> bufW1W3 = get_merged_f16_2(
                     l->w1_weight_bf16, (size_t)hidden * dim,
                     l->w3_weight_bf16, (size_t)hidden * dim);
@@ -3514,11 +4157,14 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
             }
         } /* end 26 layers */
 
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        if (ok) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
 
-        /* Download result */
-        memcpy(x, [bufX contents], (size_t)M * dim * sizeof(float));
+            /* Download result */
+            memcpy(x, [bufX contents], (size_t)M * dim * sizeof(float));
+            success = 1;
+        }
 
         pool_release_buffer(bufX);
         pool_release_buffer(bufXnorm);
@@ -3534,7 +4180,8 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
     }
 
     /* Update KV cache length */
-    ctx->kv_cache_len = start_pos + seq_len;
+    if (success) ctx->kv_cache_len = start_pos + seq_len;
+    return success;
 }
 
 /* ========================================================================

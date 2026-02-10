@@ -57,26 +57,39 @@ typedef struct {
     /* Attention weights (all have biases except wk) */
     float *wq_weight;        /* [2048, 1280] - f32 (NULL if bf16) */
     uint16_t *wq_weight_bf16;/* [2048, 1280] - bf16 mmap direct */
+    const int8_t *wq_int8;   /* [2048, 1280] - int8 quantized */
+    float wq_scale;
     float *wq_bias;          /* [2048] */
     float *wk_weight;        /* [2048, 1280] - f32 (NULL if bf16) */
     uint16_t *wk_weight_bf16;/* [2048, 1280] - bf16 mmap direct */
+    const int8_t *wk_int8;   /* [2048, 1280] - int8 quantized */
+    float wk_scale;
     /* wk has NO bias */
     float *wv_weight;        /* [2048, 1280] - f32 (NULL if bf16) */
     uint16_t *wv_weight_bf16;/* [2048, 1280] - bf16 mmap direct */
+    const int8_t *wv_int8;   /* [2048, 1280] - int8 quantized */
+    float wv_scale;
     float *wv_bias;          /* [2048] */
     float *wo_weight;        /* [1280, 2048] - f32 (NULL if bf16) */
     uint16_t *wo_weight_bf16;/* [1280, 2048] - bf16 mmap direct */
+    const int8_t *wo_int8;   /* [1280, 2048] - int8 quantized */
+    float wo_scale;
     float *wo_bias;          /* [1280] */
     float *attention_norm;   /* [1280] */
 
     /* Feed-forward (w1, w3 have no bias, w2 has bias) */
     float *w1_weight;        /* [5120, 1280] gate - f32 (NULL if bf16) */
     uint16_t *w1_weight_bf16;/* [5120, 1280] - bf16 mmap direct */
+    const int8_t *w1_int8;   /* [5120, 1280] - int8 quantized */
+    float w1_scale;
     float *w2_weight;        /* [1280, 5120] down - f32 (NULL if bf16) */
     uint16_t *w2_weight_bf16;/* [1280, 5120] - bf16 mmap direct */
+    /* Note: w2 kept at BF16 for accuracy */
     float *w2_bias;          /* [1280] */
     float *w3_weight;        /* [5120, 1280] up - f32 (NULL if bf16) */
     uint16_t *w3_weight_bf16;/* [5120, 1280] - bf16 mmap direct */
+    const int8_t *w3_int8;   /* [5120, 1280] - int8 quantized */
+    float w3_scale;
     float *ffn_norm;         /* [1280] */
 } vox_enc_layer_t;
 
@@ -106,21 +119,34 @@ typedef struct {
     /* Attention (no biases in decoder) */
     float *wq_weight;        /* [4096, 3072] - f32 (NULL if bf16) */
     uint16_t *wq_weight_bf16;/* [4096, 3072] - bf16 mmap direct */
+    const int8_t *wq_int8;   /* [4096, 3072] - int8 quantized (NULL if bf16) */
+    float wq_scale;          /* INT8 dequant scale (per-tensor) */
     float *wk_weight;        /* [1024, 3072] - f32 (NULL if bf16) */
     uint16_t *wk_weight_bf16;/* [1024, 3072] - bf16 mmap direct */
+    const int8_t *wk_int8;   /* [1024, 3072] - int8 quantized */
+    float wk_scale;
     float *wv_weight;        /* [1024, 3072] - f32 (NULL if bf16) */
     uint16_t *wv_weight_bf16;/* [1024, 3072] - bf16 mmap direct */
+    const int8_t *wv_int8;   /* [1024, 3072] - int8 quantized */
+    float wv_scale;
     float *wo_weight;        /* [3072, 4096] - f32 (NULL if bf16) */
     uint16_t *wo_weight_bf16;/* [3072, 4096] - bf16 mmap direct */
+    const int8_t *wo_int8;   /* [3072, 4096] - int8 quantized */
+    float wo_scale;
     float *attention_norm;   /* [3072] */
 
     /* Feed-forward */
     float *w1_weight;        /* [9216, 3072] gate - f32 (NULL if bf16) */
     uint16_t *w1_weight_bf16;/* [9216, 3072] - bf16 mmap direct */
+    const int8_t *w1_int8;   /* [9216, 3072] - int8 quantized */
+    float w1_scale;
     float *w2_weight;        /* [3072, 9216] down - f32 (NULL if bf16) */
     uint16_t *w2_weight_bf16;/* [3072, 9216] - bf16 mmap direct */
+    /* Note: w2 kept at BF16 for accuracy (output magnitude critical) */
     float *w3_weight;        /* [9216, 3072] up - f32 (NULL if bf16) */
     uint16_t *w3_weight_bf16;/* [9216, 3072] - bf16 mmap direct */
+    const int8_t *w3_int8;   /* [9216, 3072] - int8 quantized */
+    float w3_scale;
     float *ffn_norm;         /* [3072] */
 } vox_dec_layer_t;
 
@@ -143,8 +169,12 @@ typedef struct {
 typedef struct {
     float *linear0_weight;   /* [3072, 5120] - f32 (NULL if bf16) */
     uint16_t *linear0_weight_bf16; /* [3072, 5120] - bf16 mmap direct */
+    const int8_t *linear0_int8;    /* [3072, 5120] - int8 quantized */
+    float linear0_scale;
     float *linear1_weight;   /* [3072, 3072] - f32 (NULL if bf16) */
     uint16_t *linear1_weight_bf16; /* [3072, 3072] - bf16 mmap direct */
+    const int8_t *linear1_int8;    /* [3072, 3072] - int8 quantized */
+    float linear1_scale;
 } vox_adapter_t;
 
 /* ========================================================================

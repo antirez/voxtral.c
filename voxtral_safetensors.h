@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 /* Maximum number of tensors per file */
-#define SAFETENSORS_MAX_TENSORS 1024
+#define SAFETENSORS_MAX_TENSORS 2048
 
 /* Tensor data types */
 typedef enum {
@@ -24,6 +24,7 @@ typedef enum {
     DTYPE_I32 = 3,
     DTYPE_I64 = 4,
     DTYPE_BOOL = 5,
+    DTYPE_I8 = 6,
     DTYPE_UNKNOWN = -1
 } safetensor_dtype_t;
 
@@ -74,6 +75,24 @@ uint16_t *safetensors_get_bf16_direct(const safetensors_file_t *sf, const safete
 
 /* Check if tensor is stored in bf16 format */
 int safetensor_is_bf16(const safetensor_t *t);
+
+/* Check if tensor is stored in int8 format */
+int safetensor_is_int8(const safetensor_t *t);
+
+/* Get direct pointer to int8 data in mmap'd region (no copy, caller must NOT free)
+ * Only works for I8 tensors. Returns NULL for other dtypes.
+ * Sets *count to the number of elements if count is not NULL. */
+const int8_t *safetensors_get_int8_direct(const safetensors_file_t *sf,
+                                           const safetensor_t *t,
+                                           int64_t *count);
+
+/* Get per-tensor quantization scale factor.
+ * Looks up tensor_name + "_scale" and returns the single F32 value.
+ * Returns 1.0 if scale tensor not found.
+ *
+ * Note: per-channel scale tensors (numel != 1) are not supported. In that case
+ * this returns -1.0f. */
+float safetensors_get_scale(const safetensors_file_t *sf, const char *tensor_name);
 
 /* Get total number of elements in tensor */
 int64_t safetensor_numel(const safetensor_t *t);
