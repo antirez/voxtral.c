@@ -192,6 +192,7 @@ vox_ctx_t *vox_load(const char *model_dir) {
                               (size_t)VOX_DEC_DIM * VOX_DEC_DIM);
 
         /* Pre-warm INT8 weight caches for decoder */
+        int int8_cached = vox_metal_load_int8_cache(model_dir);
         for (int i = 0; i < VOX_DEC_LAYERS; i++) {
             vox_dec_layer_t *l = &ctx->decoder.layers[i];
             vox_metal_warmup_int8(l->wq_weight_bf16,
@@ -212,6 +213,8 @@ vox_ctx_t *vox_load(const char *model_dir) {
         }
         vox_metal_warmup_int8(ctx->decoder.tok_embeddings_bf16,
             (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM, VOX_DEC_DIM);
+        if (!int8_cached)
+            vox_metal_save_int8_cache(model_dir);
 
         /* Pre-warm decoder MPS ops and f32 weight caches */
         vox_metal_warmup_decoder_ops(ctx);

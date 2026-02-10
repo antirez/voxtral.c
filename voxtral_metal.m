@@ -15,6 +15,8 @@
 #include <string.h>
 #include <pthread.h>
 #include <mach/mach_time.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 extern int vox_verbose;
 
@@ -267,10 +269,13 @@ typedef struct {
     id<MTLBuffer> weights_buf;   /* int8_t[N * K] */
     id<MTLBuffer> scales_buf;    /* half[N * K/group_size] */
     size_t num_elements;
+    int K;
 } int8_cache_entry_t;
 
 static int8_cache_entry_t g_int8_cache[INT8_CACHE_SIZE];
 static int g_int8_cache_count = 0;
+static int g_int8_preloaded = 0;    /* 1 if cache was loaded from disk */
+static int g_int8_preload_idx = 0;  /* next slot to bind cpu_ptr during warmup */
 
 static inline float bf16_to_f32(uint16_t bf16) {
     uint32_t bits = (uint32_t)bf16 << 16;
@@ -395,6 +400,7 @@ static int get_cached_int8_buffers(const uint16_t *bf16_weights, size_t num_elem
         g_int8_cache[g_int8_cache_count].weights_buf = wb;
         g_int8_cache[g_int8_cache_count].scales_buf = sb;
         g_int8_cache[g_int8_cache_count].num_elements = num_elements;
+        g_int8_cache[g_int8_cache_count].K = K;
         g_int8_cache_count++;
     }
     *w_buf = wb;
@@ -409,6 +415,226 @@ static void clear_int8_cache(void) {
         g_int8_cache[i].cpu_ptr = NULL;
     }
     g_int8_cache_count = 0;
+    g_int8_preloaded = 0;
+    g_int8_preload_idx = 0;
+}
+
+/* ========================================================================
+ * INT8 Disk Cache (save/load pre-quantized weights)
+ * ======================================================================== */
+
+#define INT8_CACHE_MAGIC "VOXINT8"
+#define INT8_CACHE_VERSION 1
+#define INT8_CACHE_HEADER_SIZE 64
+
+/* Get safetensors file size and mtime for staleness check. */
+static int get_safetensors_stat(const char *model_dir, uint64_t *size_out,
+                                 int64_t *mtime_out) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/consolidated.safetensors", model_dir);
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    *size_out = (uint64_t)st.st_size;
+    *mtime_out = (int64_t)st.st_mtimespec.tv_sec;
+    return 1;
+}
+
+static int save_int8_cache(const char *model_dir) {
+    if (g_int8_cache_count == 0) return 0;
+
+    uint64_t sf_size = 0;
+    int64_t sf_mtime = 0;
+    if (!get_safetensors_stat(model_dir, &sf_size, &sf_mtime)) return 0;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/int8_cache.bin", model_dir);
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+
+    /* Write 64-byte header */
+    uint8_t header[INT8_CACHE_HEADER_SIZE];
+    memset(header, 0, sizeof(header));
+    memcpy(header, INT8_CACHE_MAGIC, 8);             /* [0..7]  magic */
+    uint32_t version = INT8_CACHE_VERSION;
+    memcpy(header + 8, &version, 4);                  /* [8..11] version */
+    uint32_t group_size = INT8_GROUP_SIZE;
+    memcpy(header + 12, &group_size, 4);              /* [12..15] group_size */
+    uint32_t num_entries = (uint32_t)g_int8_cache_count;
+    memcpy(header + 16, &num_entries, 4);              /* [16..19] num_entries */
+    /* [20..23] reserved */
+    memcpy(header + 24, &sf_size, 8);                  /* [24..31] safetensors_size */
+    memcpy(header + 32, &sf_mtime, 8);                 /* [32..39] safetensors_mtime */
+    /* [40..63] reserved */
+
+    if (fwrite(header, 1, INT8_CACHE_HEADER_SIZE, f) != INT8_CACHE_HEADER_SIZE) {
+        fclose(f);
+        unlink(path);
+        return 0;
+    }
+
+    /* Write each entry: metadata + weights + scales */
+    for (int i = 0; i < g_int8_cache_count; i++) {
+        int8_cache_entry_t *e = &g_int8_cache[i];
+        int K = e->K;
+        int N = (int)(e->num_elements / (size_t)K);
+        int n_groups = K / INT8_GROUP_SIZE;
+        size_t weights_bytes = (size_t)N * K;
+        size_t scales_bytes = (size_t)N * n_groups * sizeof(uint16_t);
+
+        /* Entry header: 16 bytes */
+        uint64_t num_el = (uint64_t)e->num_elements;
+        int32_t k_val = (int32_t)K;
+        int32_t pad = 0;
+        if (fwrite(&num_el, 8, 1, f) != 1) goto fail;
+        if (fwrite(&k_val, 4, 1, f) != 1) goto fail;
+        if (fwrite(&pad, 4, 1, f) != 1) goto fail;
+
+        /* Weight data */
+        const void *w_ptr = [e->weights_buf contents];
+        if (fwrite(w_ptr, 1, weights_bytes, f) != weights_bytes) goto fail;
+
+        /* Scale data */
+        const void *s_ptr = [e->scales_buf contents];
+        if (fwrite(s_ptr, 1, scales_bytes, f) != scales_bytes) goto fail;
+    }
+
+    fclose(f);
+    if (vox_verbose >= 1)
+        fprintf(stderr, "INT8 cache: saved %d entries to %s\n",
+                g_int8_cache_count, path);
+    return 1;
+
+fail:
+    fclose(f);
+    unlink(path);
+    return 0;
+}
+
+static int load_int8_cache(const char *model_dir) {
+    uint64_t sf_size = 0;
+    int64_t sf_mtime = 0;
+    if (!get_safetensors_stat(model_dir, &sf_size, &sf_mtime)) return 0;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/int8_cache.bin", model_dir);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    /* Read and validate header */
+    uint8_t header[INT8_CACHE_HEADER_SIZE];
+    if (fread(header, 1, INT8_CACHE_HEADER_SIZE, f) != INT8_CACHE_HEADER_SIZE) {
+        fclose(f);
+        return 0;
+    }
+
+    if (memcmp(header, INT8_CACHE_MAGIC, 8) != 0) { fclose(f); return 0; }
+
+    uint32_t version;
+    memcpy(&version, header + 8, 4);
+    if (version != INT8_CACHE_VERSION) { fclose(f); return 0; }
+
+    uint32_t group_size;
+    memcpy(&group_size, header + 12, 4);
+    if (group_size != INT8_GROUP_SIZE) { fclose(f); return 0; }
+
+    uint32_t num_entries;
+    memcpy(&num_entries, header + 16, 4);
+    if (num_entries == 0 || num_entries > INT8_CACHE_SIZE) { fclose(f); return 0; }
+
+    /* Staleness check */
+    uint64_t stored_size;
+    int64_t stored_mtime;
+    memcpy(&stored_size, header + 24, 8);
+    memcpy(&stored_mtime, header + 32, 8);
+    if (stored_size != sf_size || stored_mtime != sf_mtime) {
+        if (vox_verbose >= 1)
+            fprintf(stderr, "INT8 cache: stale, regenerating\n");
+        fclose(f);
+        return 0;
+    }
+
+    /* Read entries and create Metal buffers */
+    g_int8_cache_count = 0;
+    for (uint32_t i = 0; i < num_entries; i++) {
+        uint64_t num_el;
+        int32_t k_val, pad;
+        if (fread(&num_el, 8, 1, f) != 1) goto fail;
+        if (fread(&k_val, 4, 1, f) != 1) goto fail;
+        if (fread(&pad, 4, 1, f) != 1) goto fail;
+
+        int K = (int)k_val;
+        int N = (int)(num_el / (size_t)K);
+        int n_groups = K / INT8_GROUP_SIZE;
+        size_t weights_bytes = (size_t)N * K;
+        size_t scales_bytes = (size_t)N * n_groups * sizeof(uint16_t);
+
+        /* Read weights into temp buffer, create Metal buffer */
+        void *w_data = malloc(weights_bytes);
+        if (!w_data) goto fail;
+        if (fread(w_data, 1, weights_bytes, f) != weights_bytes) {
+            free(w_data);
+            goto fail;
+        }
+        id<MTLBuffer> w_buf = [g_device newBufferWithBytes:w_data
+                                                     length:weights_bytes
+                                                    options:MTLResourceStorageModeShared];
+        free(w_data);
+        if (!w_buf) goto fail;
+
+        /* Read scales into temp buffer, create Metal buffer */
+        void *s_data = malloc(scales_bytes);
+        if (!s_data) goto fail;
+        if (fread(s_data, 1, scales_bytes, f) != scales_bytes) {
+            free(s_data);
+            goto fail;
+        }
+        id<MTLBuffer> s_buf = [g_device newBufferWithBytes:s_data
+                                                     length:scales_bytes
+                                                    options:MTLResourceStorageModeShared];
+        free(s_data);
+        if (!s_buf) goto fail;
+
+        /* Populate cache entry — cpu_ptr is NULL, will be bound during warmup */
+        g_int8_cache[i].cpu_ptr = NULL;
+        g_int8_cache[i].weights_buf = w_buf;
+        g_int8_cache[i].scales_buf = s_buf;
+        g_int8_cache[i].num_elements = (size_t)num_el;
+        g_int8_cache[i].K = K;
+        g_int8_cache_count = (int)(i + 1);
+    }
+    g_int8_preloaded = 1;
+    g_int8_preload_idx = 0;
+
+    fclose(f);
+    if (vox_verbose >= 1)
+        fprintf(stderr, "INT8 cache: loaded %u entries from %s\n",
+                num_entries, path);
+    return 1;
+
+fail:
+    /* Cleanup any partially loaded entries */
+    for (int i = 0; i < g_int8_cache_count; i++) {
+        g_int8_cache[i].weights_buf = nil;
+        g_int8_cache[i].scales_buf = nil;
+        g_int8_cache[i].cpu_ptr = NULL;
+    }
+    g_int8_cache_count = 0;
+    g_int8_preloaded = 0;
+    fclose(f);
+    return 0;
+}
+
+/* Public API for INT8 disk cache. */
+int vox_metal_load_int8_cache(const char *model_dir) {
+    if (!g_initialized || !model_dir) return 0;
+    return load_int8_cache(model_dir);
+}
+
+void vox_metal_save_int8_cache(const char *model_dir) {
+    if (!g_initialized || !model_dir) return;
+    save_int8_cache(model_dir);
 }
 
 /* ========================================================================
@@ -2806,6 +3032,8 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
 
         /* Download result */
         memcpy(x, [bufX contents], (size_t)M * dim * sizeof(float));
+
+        /* Update KV cache length (only on success — goto cleanup skips this) */
         ctx->kv_cache_len = start_pos + seq_len;
 
     cleanup:
@@ -2820,7 +3048,6 @@ void vox_metal_decoder_prefill_step(void *ctx_ptr, float *x, int seq_len,
         pool_release_buffer(bufFfnOut);
         pool_release_buffer(bufRope);
     }
-
 }
 
 /* ========================================================================
@@ -2847,6 +3074,19 @@ void vox_metal_warmup_merged_3(const uint16_t *a, size_t a_n,
 
 void vox_metal_warmup_int8(const uint16_t *bf16_weights, size_t num_elements, int K) {
     if (!g_initialized || !bf16_weights || num_elements == 0) return;
+    if (g_int8_preloaded && g_int8_preload_idx < g_int8_cache_count) {
+        int8_cache_entry_t *e = &g_int8_cache[g_int8_preload_idx];
+        if (e->num_elements == num_elements && e->K == K) {
+            e->cpu_ptr = bf16_weights;
+            g_int8_preload_idx++;
+            return;
+        }
+        /* Dimension mismatch — cache order changed, requantize everything. */
+        if (vox_verbose >= 1)
+            fprintf(stderr, "INT8 cache: entry %d mismatch, regenerating\n",
+                    g_int8_preload_idx);
+        clear_int8_cache();
+    }
     id<MTLBuffer> w, s;
     (void)get_cached_int8_buffers(bf16_weights, num_elements, K, &w, &s);
 }

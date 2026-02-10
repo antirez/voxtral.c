@@ -181,6 +181,12 @@ size_t vox_metal_memory_used(void);
 /* Pre-warm INT8 weight cache for a decoder weight tensor. */
 void vox_metal_warmup_int8(const uint16_t *bf16_weights, size_t num_elements, int K);
 
+/* Load pre-quantized INT8 weights from disk cache. Returns 1 on success. */
+int vox_metal_load_int8_cache(const char *model_dir);
+
+/* Save quantized INT8 weights to disk cache for fast subsequent loads. */
+void vox_metal_save_int8_cache(const char *model_dir);
+
 
 #ifdef __cplusplus
 }
