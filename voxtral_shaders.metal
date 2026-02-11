@@ -593,3 +593,71 @@ kernel void silu_mul_merged(
     g = g / (1.0f + exp(-g));  /* silu */
     data[idx_gate] = g * data[idx_up];
 }
+
+/* ========================================================================
+ * INT8 Matrix Multiply: out[M, N] = X[M, K] @ W_int8[N, K]^T
+ * with per-group symmetric dequantization (weight-only quantization).
+ *
+ * Weight-only: weights are INT8, activations stay F32. Apple Silicon has no
+ * INT8 tensor cores, so quantizing activations would add error for unlikely
+ * throughput gain. At M=1 (autoregressive decode) this is bandwidth-bound;
+ * INT8 weights halve the bytes read vs F16.
+ *
+ * W_int8: int8_t[N * K], row-major (each row is one output neuron).
+ * scales: half[N * (K / group_size)], one scale per group of group_size weights.
+ * X: float[M * K] input (row-major).
+ * out: float[M * N] output (row-major).
+ *
+ * Flat 1D grid: M*N threadgroups. gid_flat = m*N + n, decomposed into
+ * output column (weight row) and input row (batch index). For M=1 this
+ * is identical to the old matvec kernel. 256 threads cooperate on each
+ * dot product using SIMD reductions (8 SIMD groups of 32) with char4
+ * vectorized loads.
+ * ======================================================================== */
+
+kernel void int8_matmul(
+    device const char *W [[buffer(0)]],       /* int8_t[N * K] */
+    device const half *scales [[buffer(1)]],   /* half[N * n_groups] */
+    device const float *X [[buffer(2)]],       /* float[M * K] */
+    device float *out [[buffer(3)]],           /* float[M * N] */
+    constant int &K [[buffer(4)]],
+    constant int &N_param [[buffer(5)]],       /* output cols (for indexing) */
+    constant int &group_size [[buffer(6)]],
+    uint gid_flat [[threadgroup_position_in_grid]],  /* flat: m * N + n */
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]
+) {
+    int row = (int)gid_flat % N_param;   /* weight row = output column */
+    int m = (int)gid_flat / N_param;     /* input row = batch index */
+    int n_groups = K / group_size;
+    device const char4 *w_row4 = (device const char4 *)(W + (long)row * K);
+    device const half *s_row = scales + (long)row * n_groups;
+    device const float *x_row = X + (long)m * K;
+
+    float acc = 0.0f;
+    int K4 = K / 4;
+
+    /* Each thread strides across K/4 vec4 elements with step 256 */
+    for (int k4 = (int)tid; k4 < K4; k4 += 256) {
+        int k = k4 * 4;
+        float scale_val = (float)s_row[k / group_size];
+        char4 w4 = w_row4[k4];
+        float4 x4 = float4(x_row[k], x_row[k+1], x_row[k+2], x_row[k+3]);
+        acc += scale_val * ((float)w4.x * x4.x + (float)w4.y * x4.y +
+                            (float)w4.z * x4.z + (float)w4.w * x4.w);
+    }
+
+    /* SIMD reduction within each group of 32 */
+    acc = simd_sum(acc);
+
+    /* Cross-SIMD reduction: 8 groups → 1 value */
+    threadgroup float shared[8];
+    if (simd_lid == 0) shared[simd_gid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        out[(long)m * N_param + row] = shared[0] + shared[1] + shared[2] + shared[3] +
+                                        shared[4] + shared[5] + shared[6] + shared[7];
+    }
+}

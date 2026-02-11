@@ -200,6 +200,10 @@ Plus `norm.weight [3072]` (final norm). NO biases in decoder.
 
 ## Decoder Forward Pass
 
+The Metal backend quantizes all decoder matmul weights from BF16 to per-group symmetric
+INT8 (group_size=128). Quantized weights are cached to disk (int8_cache.bin) and reused
+on subsequent runs. The encoder stays F16/MPS.
+
 Per-layer computation for hidden state `h` at positions `pos .. pos+seq-1`:
 
 1. **Attention RMSNorm**: `x = RMSNorm(h, attention_norm, eps=1e-5)`

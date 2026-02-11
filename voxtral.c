@@ -191,40 +191,30 @@ vox_ctx_t *vox_load(const char *model_dir) {
         vox_metal_warmup_bf16(ctx->adapter.linear1_weight_bf16,
                               (size_t)VOX_DEC_DIM * VOX_DEC_DIM);
 
-        /* Decoder weights (26 layers) */
+        /* Pre-warm INT8 weight caches for decoder */
+        int int8_cached = vox_metal_load_int8_cache(model_dir);
         for (int i = 0; i < VOX_DEC_LAYERS; i++) {
             vox_dec_layer_t *l = &ctx->decoder.layers[i];
-            size_t dec_q  = (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM;
-            size_t dec_kv = (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM;
-            size_t dec_wo = (size_t)VOX_DEC_DIM * (VOX_DEC_HEADS * VOX_DEC_HEAD_DIM);
-            size_t dec_f1 = (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM;
-            size_t dec_f2 = (size_t)VOX_DEC_DIM * VOX_DEC_HIDDEN;
-            vox_metal_warmup_bf16(l->wq_weight_bf16, dec_q);
-            vox_metal_warmup_bf16(l->wk_weight_bf16, dec_kv);
-            vox_metal_warmup_bf16(l->wv_weight_bf16, dec_kv);
-            vox_metal_warmup_bf16(l->wo_weight_bf16, dec_wo);
-            vox_metal_warmup_bf16(l->w1_weight_bf16, dec_f1);
-            vox_metal_warmup_bf16(l->w2_weight_bf16, dec_f2);
-            vox_metal_warmup_bf16(l->w3_weight_bf16, dec_f1);
+            vox_metal_warmup_int8(l->wq_weight_bf16,
+                (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM, VOX_DEC_DIM);
+            vox_metal_warmup_int8(l->wk_weight_bf16,
+                (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM, VOX_DEC_DIM);
+            vox_metal_warmup_int8(l->wv_weight_bf16,
+                (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM, VOX_DEC_DIM);
+            vox_metal_warmup_int8(l->wo_weight_bf16,
+                (size_t)VOX_DEC_DIM * (VOX_DEC_HEADS * VOX_DEC_HEAD_DIM),
+                VOX_DEC_HEADS * VOX_DEC_HEAD_DIM);
+            vox_metal_warmup_int8(l->w1_weight_bf16,
+                (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM, VOX_DEC_DIM);
+            vox_metal_warmup_int8(l->w2_weight_bf16,
+                (size_t)VOX_DEC_DIM * VOX_DEC_HIDDEN, VOX_DEC_HIDDEN);
+            vox_metal_warmup_int8(l->w3_weight_bf16,
+                (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM, VOX_DEC_DIM);
         }
-
-        /* Token embeddings (also used as logits projection) */
-        vox_metal_warmup_bf16(ctx->decoder.tok_embeddings_bf16,
-                              (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM);
-
-        /* Pre-warm merged weight buffers for monolithic decoder step */
-        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
-            vox_dec_layer_t *l = &ctx->decoder.layers[i];
-            /* Merged QKV = wq + wk + wv */
-            vox_metal_warmup_merged_3(
-                l->wq_weight_bf16, (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
-                l->wk_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM,
-                l->wv_weight_bf16, (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM);
-            /* Merged w1+w3 */
-            vox_metal_warmup_merged_2(
-                l->w1_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM,
-                l->w3_weight_bf16, (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM);
-        }
+        vox_metal_warmup_int8(ctx->decoder.tok_embeddings_bf16,
+            (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM, VOX_DEC_DIM);
+        if (!int8_cached)
+            vox_metal_save_int8_cache(model_dir);
 
         /* Pre-warm decoder MPS ops and f32 weight caches */
         vox_metal_warmup_decoder_ops(ctx);
