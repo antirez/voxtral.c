@@ -579,14 +579,20 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             vox_metal_encoder_attention(attn_out, q, full_k, full_v,
                                          new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
                                          head_dim, scale, VOX_ENC_WINDOW, cache_len);
-        } else {
+        } else
 #endif
+#ifdef USE_CUDA
+        if (vox_cuda_available() && ctx->enc_kv_cache_is_shared) {
+            vox_cuda_causal_attention(attn_out, q, full_k, full_v,
+                                       new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
+                                       head_dim, scale, VOX_ENC_WINDOW, cache_len);
+        } else
+#endif
+        {
             vox_causal_attention(attn_out, q, full_k, full_v,
                                  new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
                                  head_dim, scale, VOX_ENC_WINDOW, cache_len);
-#ifdef USE_METAL
         }
-#endif
 
         /* Output projection + residual */
 #ifdef USE_METAL

@@ -261,6 +261,144 @@ __global__ void kernel_f32_to_bf16(__nv_bfloat16 *out, const float *in, int n) {
 }
 
 /* ========================================================================
+ * Causal Attention Kernel
+ *
+ * Grid: (n_heads, seq_q) — one block per (head, query position)
+ * Block: (head_dim) threads — one thread per dimension
+ *
+ * Online softmax: each thread tracks its own output dimension.
+ * Dot product (Q·K) is reduced across threads via warp shuffle + shared memory.
+ * ======================================================================== */
+
+__global__ void kernel_causal_attention(
+    float *out,             /* [seq_q, n_heads * head_dim] */
+    const float *Q,         /* [seq_q, n_heads * head_dim] device memory */
+    const float *K,         /* [seq_k, n_kv_heads * head_dim] managed memory */
+    const float *V,         /* [seq_k, n_kv_heads * head_dim] managed memory */
+    int seq_k,
+    int n_heads, int n_kv_heads,
+    int head_dim,
+    float scale,
+    int window_size,
+    int q_offset)
+{
+    int h = blockIdx.x;            /* head index */
+    int i = blockIdx.y;            /* query position index */
+    int tid = threadIdx.x;         /* dimension index [0, head_dim) */
+
+    int heads_per_kv = n_heads / n_kv_heads;
+    int kv_h = h / heads_per_kv;
+    int q_hidden = n_heads * head_dim;
+    int kv_hidden = n_kv_heads * head_dim;
+
+    /* Load Q element for this thread's dimension */
+    float q_val = Q[i * q_hidden + h * head_dim + tid];
+
+    /* Compute valid K range (causal + sliding window) */
+    int global_pos = q_offset + i;
+    int k_start = 0;
+    if (window_size > 0 && global_pos - window_size + 1 > 0)
+        k_start = global_pos - window_size + 1;
+    int k_end = global_pos + 1;
+    if (k_end > seq_k) k_end = seq_k;
+
+    /* Shared memory for inter-warp dot product reduction */
+    extern __shared__ float s_warp[];
+    int n_warps = (blockDim.x + 31) / 32;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    /* Online softmax state (per-thread, each tracks one output dimension) */
+    float max_score = -1e30f;
+    float sum_exp = 0.0f;
+    float o_val = 0.0f;
+
+    for (int j = k_start; j < k_end; j++) {
+        /* Dot product: q · k (partial per thread, reduce across block) */
+        float k_val = K[(size_t)j * kv_hidden + kv_h * head_dim + tid];
+        float partial = q_val * k_val;
+
+        /* Warp-level reduction via shuffle */
+        for (int offset = 16; offset > 0; offset >>= 1)
+            partial += __shfl_down_sync(0xffffffff, partial, offset);
+
+        /* Inter-warp reduction via shared memory */
+        if (lane_id == 0) s_warp[warp_id] = partial;
+        __syncthreads();
+
+        float score;
+        if (tid == 0) {
+            score = 0.0f;
+            for (int w = 0; w < n_warps; w++) score += s_warp[w];
+            score *= scale;
+            s_warp[0] = score;  /* broadcast to all threads */
+        }
+        __syncthreads();
+        score = s_warp[0];
+
+        /* Load V element for this thread's dimension */
+        float v_val = V[(size_t)j * kv_hidden + kv_h * head_dim + tid];
+
+        /* Online softmax update */
+        if (score > max_score) {
+            float correction = expf(max_score - score);
+            sum_exp = sum_exp * correction + 1.0f;
+            o_val = o_val * correction + v_val;
+            max_score = score;
+        } else {
+            float weight = expf(score - max_score);
+            sum_exp += weight;
+            o_val += weight * v_val;
+        }
+    }
+
+    /* Normalize and write output */
+    if (sum_exp > 0.0f) o_val /= sum_exp;
+    out[i * q_hidden + h * head_dim + tid] = o_val;
+}
+
+extern "C" void vox_cuda_causal_attention(
+    float *out, const float *Q, const float *K, const float *V,
+    int seq_q, int seq_k, int n_heads, int n_kv_heads,
+    int head_dim, float scale, int window_size, int q_offset)
+{
+    if (!g_initialized) return;
+
+    int q_hidden = n_heads * head_dim;
+    size_t q_bytes = (size_t)seq_q * q_hidden * sizeof(float);
+    size_t out_bytes = q_bytes;
+
+    /* Upload Q, allocate output on device */
+    void *d_Q = pool_alloc(q_bytes);
+    void *d_out = pool_alloc(out_bytes);
+    if (!d_Q || !d_out) {
+        if (d_Q) pool_free(d_Q);
+        if (d_out) pool_free(d_out);
+        return;
+    }
+
+    cudaMemcpyAsync(d_Q, Q, q_bytes, cudaMemcpyHostToDevice, g_stream);
+
+    /* K, V are in managed memory — pass directly to kernel */
+    dim3 grid(n_heads, seq_q);
+    dim3 block(head_dim);
+    int n_warps = (head_dim + 31) / 32;
+    size_t smem = n_warps * sizeof(float);
+
+    kernel_causal_attention<<<grid, block, smem, g_stream>>>(
+        (float *)d_out, (float *)d_Q, K, V,
+        seq_k, n_heads, n_kv_heads,
+        head_dim, scale, window_size, q_offset);
+
+    /* Download result */
+    cudaMemcpyAsync(out, d_out, out_bytes, cudaMemcpyDeviceToHost, g_stream);
+    cudaStreamSynchronize(g_stream);
+
+    pool_free(d_Q);
+    pool_free(d_out);
+}
+
+/* ========================================================================
  * Matrix Multiplication
  * ======================================================================== */
 
@@ -401,7 +539,9 @@ extern "C" void *vox_cuda_shared_alloc(size_t size) {
                 size, cudaGetErrorString(err));
         return calloc(1, size);
     }
+
     memset(ptr, 0, size);
+
     g_memory_used += size;
     return ptr;
 }

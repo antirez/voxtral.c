@@ -50,6 +50,18 @@ void vox_cuda_sgemm(int M, int N, int K,
                      float *C);
 
 /*
+ * GPU causal attention with online softmax.
+ * out[seq_q, n_heads * head_dim] = softmax(Q @ K^T * scale) @ V
+ *
+ * Q and out are in CPU memory (uploaded/downloaded automatically).
+ * K and V must be in CUDA managed memory (KV cache).
+ * Supports GQA (n_heads > n_kv_heads), sliding window, and causal masking.
+ */
+void vox_cuda_causal_attention(float *out, const float *Q, const float *K, const float *V,
+                                int seq_q, int seq_k, int n_heads, int n_kv_heads,
+                                int head_dim, float scale, int window_size, int q_offset);
+
+/*
  * Pre-warm the bf16 weight cache by uploading to GPU.
  * Call during model loading to avoid first-use latency.
  */
