@@ -13,6 +13,9 @@
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -241,6 +244,85 @@ vox_ctx_t *vox_load(const char *model_dir) {
     }
 #endif
 
+#ifdef USE_CUDA
+    /* Pre-warm CUDA bf16 weight cache to avoid first-token latency */
+    if (vox_cuda_available()) {
+        if (vox_verbose >= 2)
+            fprintf(stderr, "Pre-warming CUDA weight cache...\n");
+
+        /* Encoder weights */
+        for (int i = 0; i < VOX_ENC_LAYERS; i++) {
+            vox_enc_layer_t *l = &ctx->encoder.layers[i];
+            size_t enc_attn = (size_t)(VOX_ENC_HEADS * VOX_ENC_HEAD_DIM) * VOX_ENC_DIM;
+            size_t enc_wo   = (size_t)VOX_ENC_DIM * (VOX_ENC_HEADS * VOX_ENC_HEAD_DIM);
+            size_t enc_ffn1 = (size_t)VOX_ENC_HIDDEN * VOX_ENC_DIM;
+            size_t enc_ffn2 = (size_t)VOX_ENC_DIM * VOX_ENC_HIDDEN;
+            vox_cuda_warmup_bf16(l->wq_weight_bf16, enc_attn);
+            vox_cuda_warmup_bf16(l->wk_weight_bf16, enc_attn);
+            vox_cuda_warmup_bf16(l->wv_weight_bf16, enc_attn);
+            vox_cuda_warmup_bf16(l->wo_weight_bf16, enc_wo);
+            vox_cuda_warmup_bf16(l->w1_weight_bf16, enc_ffn1);
+            vox_cuda_warmup_bf16(l->w2_weight_bf16, enc_ffn2);
+            vox_cuda_warmup_bf16(l->w3_weight_bf16, enc_ffn1);
+        }
+
+        /* Adapter weights */
+        vox_cuda_warmup_bf16(ctx->adapter.linear0_weight_bf16,
+                             (size_t)VOX_DEC_DIM * (VOX_ENC_DIM * VOX_DOWNSAMPLE));
+        vox_cuda_warmup_bf16(ctx->adapter.linear1_weight_bf16,
+                             (size_t)VOX_DEC_DIM * VOX_DEC_DIM);
+
+        /* Decoder weights */
+        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
+            vox_dec_layer_t *l = &ctx->decoder.layers[i];
+            size_t dec_q  = (size_t)(VOX_DEC_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM;
+            size_t dec_kv = (size_t)(VOX_DEC_KV_HEADS * VOX_DEC_HEAD_DIM) * VOX_DEC_DIM;
+            size_t dec_wo = (size_t)VOX_DEC_DIM * (VOX_DEC_HEADS * VOX_DEC_HEAD_DIM);
+            size_t dec_f1 = (size_t)VOX_DEC_HIDDEN * VOX_DEC_DIM;
+            size_t dec_f2 = (size_t)VOX_DEC_DIM * VOX_DEC_HIDDEN;
+            vox_cuda_warmup_bf16(l->wq_weight_bf16, dec_q);
+            vox_cuda_warmup_bf16(l->wk_weight_bf16, dec_kv);
+            vox_cuda_warmup_bf16(l->wv_weight_bf16, dec_kv);
+            vox_cuda_warmup_bf16(l->wo_weight_bf16, dec_wo);
+            vox_cuda_warmup_bf16(l->w1_weight_bf16, dec_f1);
+            vox_cuda_warmup_bf16(l->w2_weight_bf16, dec_f2);
+            vox_cuda_warmup_bf16(l->w3_weight_bf16, dec_f1);
+        }
+
+        /* Token embeddings */
+        vox_cuda_warmup_bf16(ctx->decoder.tok_embeddings_bf16,
+                             (size_t)VOX_VOCAB_SIZE * VOX_DEC_DIM);
+
+        /* Pre-warm f32 weights (norms, biases, ada_scale) for monolithic GPU steps */
+        for (int i = 0; i < VOX_ENC_LAYERS; i++) {
+            vox_enc_layer_t *l = &ctx->encoder.layers[i];
+            vox_cuda_warmup_f32(l->attention_norm, VOX_ENC_DIM);
+            vox_cuda_warmup_f32(l->ffn_norm, VOX_ENC_DIM);
+            vox_cuda_warmup_f32(l->wq_bias, VOX_ENC_HEADS * VOX_ENC_HEAD_DIM);
+            vox_cuda_warmup_f32(l->wv_bias, VOX_ENC_HEADS * VOX_ENC_HEAD_DIM);
+            vox_cuda_warmup_f32(l->wo_bias, VOX_ENC_DIM);
+            vox_cuda_warmup_f32(l->w2_bias, VOX_ENC_DIM);
+        }
+        vox_cuda_warmup_f32(ctx->encoder.norm, VOX_ENC_DIM);
+        for (int i = 0; i < VOX_DEC_LAYERS; i++) {
+            vox_dec_layer_t *l = &ctx->decoder.layers[i];
+            vox_cuda_warmup_f32(l->attention_norm, VOX_DEC_DIM);
+            vox_cuda_warmup_f32(l->ffn_norm, VOX_DEC_DIM);
+            if (ctx->ada_scale)
+                vox_cuda_warmup_f32(ctx->ada_scale + (size_t)i * VOX_DEC_DIM, VOX_DEC_DIM);
+        }
+        vox_cuda_warmup_f32(ctx->decoder.norm, VOX_DEC_DIM);
+
+        /* Pre-allocate KV caches (unified memory) */
+        vox_decoder_kv_cache_preallocate(ctx, VOX_DEC_WINDOW + 1024);
+        vox_encoder_kv_cache_preallocate(ctx, VOX_ENC_WINDOW + 256);
+
+        if (vox_verbose >= 1)
+            fprintf(stderr, "CUDA GPU: %.1f MB\n",
+                    vox_cuda_memory_used() / (1024.0 * 1024.0));
+    }
+#endif
+
     if (vox_verbose >= 1)
         fprintf(stderr, "Model loaded.\n");
     return ctx;
@@ -285,17 +367,25 @@ void vox_free(vox_ctx_t *ctx) {
 
     #undef FREE0
 
-#ifdef USE_METAL
+#if defined(USE_METAL)
     vox_metal_shared_free(ctx->kv_cache_k);
     vox_metal_shared_free(ctx->kv_cache_v);
+#elif defined(USE_CUDA)
+    vox_cuda_shared_free(ctx->kv_cache_k);
+    vox_cuda_shared_free(ctx->kv_cache_v);
 #else
     free(ctx->kv_cache_k);
     free(ctx->kv_cache_v);
 #endif
-#ifdef USE_METAL
+#if defined(USE_METAL)
     if (ctx->enc_kv_cache_is_shared) {
         vox_metal_shared_free(ctx->enc_kv_cache_k);
         vox_metal_shared_free(ctx->enc_kv_cache_v);
+    } else
+#elif defined(USE_CUDA)
+    if (ctx->enc_kv_cache_is_shared) {
+        vox_cuda_shared_free(ctx->enc_kv_cache_k);
+        vox_cuda_shared_free(ctx->enc_kv_cache_v);
     } else
 #endif
     {

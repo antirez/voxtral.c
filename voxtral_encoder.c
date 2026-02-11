@@ -18,6 +18,9 @@
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -337,6 +340,13 @@ int vox_encoder_kv_cache_preallocate(vox_ctx_t *ctx, int max_pos) {
         ctx->enc_kv_cache_is_shared = 1;
     } else
 #endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        ctx->enc_kv_cache_k = (float *)vox_cuda_shared_alloc(total);
+        ctx->enc_kv_cache_v = (float *)vox_cuda_shared_alloc(total);
+        ctx->enc_kv_cache_is_shared = 1;
+    } else
+#endif
     {
         ctx->enc_kv_cache_k = (float *)calloc(1, total);
         ctx->enc_kv_cache_v = (float *)calloc(1, total);
@@ -504,7 +514,7 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
     float *rope_freqs = ctx->enc_inc_rope_freqs;
     vox_compute_rope_freqs(rope_freqs, positions, new_len, head_dim, VOX_ROPE_THETA);
 
-    /* GPU monolithic path: all 32 layers in one command buffer */
+    /* GPU monolithic path: all layers in one command buffer */
 #ifdef USE_METAL
     if (vox_metal_available() && ctx->enc_kv_cache_is_shared) {
         if (vox_metal_encoder_full_step(ctx, x, new_len, rope_freqs, cache_len) == 0) {
@@ -513,6 +523,14 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             return x;
         }
         /* Fall through to CPU path on failure */
+    }
+#endif
+#ifdef USE_CUDA
+    if (vox_cuda_available() && ctx->enc_kv_cache_is_shared) {
+        if (vox_cuda_encoder_step(ctx, x, new_len, rope_freqs, cache_len) == 0) {
+            *out_len = new_len;
+            return x;
+        }
     }
 #endif
 
@@ -569,14 +587,20 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             vox_metal_encoder_attention(attn_out, q, full_k, full_v,
                                          new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
                                          head_dim, scale, VOX_ENC_WINDOW, cache_len);
-        } else {
+        } else
 #endif
+#ifdef USE_CUDA
+        if (vox_cuda_available() && ctx->enc_kv_cache_is_shared) {
+            vox_cuda_causal_attention(attn_out, q, full_k, full_v,
+                                       new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
+                                       head_dim, scale, VOX_ENC_WINDOW, cache_len);
+        } else
+#endif
+        {
             vox_causal_attention(attn_out, q, full_k, full_v,
                                  new_len, total_kv, n_heads, VOX_ENC_KV_HEADS,
                                  head_dim, scale, VOX_ENC_WINDOW, cache_len);
-#ifdef USE_METAL
         }
-#endif
 
         /* Output projection + residual */
 #ifdef USE_METAL

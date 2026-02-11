@@ -12,6 +12,10 @@
 #include "voxtral_metal.h"
 #endif
 
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
+
 #ifdef USE_BLAS
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -202,6 +206,12 @@ void vox_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
         return;
     }
 #endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_sgemm_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
+        return;
+    }
+#endif
     if (seq_len == 1) {
         bf16_matvec_fused(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
@@ -218,6 +228,19 @@ void vox_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 #ifdef USE_METAL
     if (vox_metal_available()) {
         vox_metal_sgemm_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_sgemm_bf16(seq_len, out_dim, in_dim, x, W_bf16, y);
         if (b != NULL) {
             for (int s = 0; s < seq_len; s++) {
                 for (int o = 0; o < out_dim; o++) {
@@ -249,6 +272,12 @@ void vox_matmul_t_bf16(float *C, const float *A, const uint16_t *B_bf16,
 #ifdef USE_METAL
     if (vox_metal_available()) {
         vox_metal_sgemm_bf16(M, N, K, A, B_bf16, C);
+        return;
+    }
+#endif
+#ifdef USE_CUDA
+    if (vox_cuda_available()) {
+        vox_cuda_sgemm_bf16(M, N, K, A, B_bf16, C);
         return;
     }
 #endif

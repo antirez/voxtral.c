@@ -11,6 +11,9 @@
 #ifdef USE_METAL
 #include "voxtral_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "voxtral_cuda.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -173,6 +176,9 @@ int main(int argc, char **argv) {
 
 #ifdef USE_METAL
     vox_metal_init();
+#endif
+#ifdef USE_CUDA
+    vox_cuda_init();
 #endif
 
     /* Load model */
@@ -387,6 +393,9 @@ int main(int argc, char **argv) {
     vox_free(ctx);
 #ifdef USE_METAL
     vox_metal_shutdown();
+#endif
+#ifdef USE_CUDA
+    vox_cuda_shutdown();
 #endif
     return 0;
 }

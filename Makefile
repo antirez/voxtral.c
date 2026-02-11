@@ -18,7 +18,7 @@ TARGET = voxtral
 # Debug build flags
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
 
-.PHONY: all clean debug info help blas mps inspect test
+.PHONY: all clean debug info help blas mps cuda inspect test
 
 # Default: show available targets
 all: help
@@ -32,6 +32,9 @@ ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
 endif
+endif
+ifneq ($(UNAME_S),Darwin)
+	@echo "  make cuda     - NVIDIA GPU with cuBLAS (requires CUDA toolkit, SM 8.0+)"
 endif
 	@echo ""
 	@echo "Other targets:"
@@ -96,6 +99,27 @@ mps:
 endif
 
 # =============================================================================
+# Backend: cuda (NVIDIA GPU with cuBLAS)
+# =============================================================================
+NVCC = nvcc
+CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_CUDA -DUSE_OPENBLAS -I/usr/include/openblas
+CUDA_NVCCFLAGS = -O3 -arch=sm_80 --use_fast_math -Xcompiler -fPIC
+CUDA_LDFLAGS = $(LDFLAGS) -lopenblas -lcudart -lcublas -lstdc++
+
+cuda: clean cuda-build
+	@echo ""
+	@echo "Built with CUDA backend (cuBLAS GPU acceleration)"
+
+cuda-build: $(SRCS:.c=.cuda.o) voxtral_cuda.o main.cuda.o
+	$(CC) $(CUDA_CFLAGS) -o $(TARGET) $^ $(CUDA_LDFLAGS)
+
+%.cuda.o: %.c voxtral.h voxtral_kernels.h
+	$(CC) $(CUDA_CFLAGS) -c -o $@ $<
+
+voxtral_cuda.o: voxtral_cuda.cu voxtral_cuda.h
+	$(NVCC) $(CUDA_NVCCFLAGS) -c -o $@ $<
+
+# =============================================================================
 # Build rules
 # =============================================================================
 $(TARGET): $(OBJS) main.o
@@ -126,7 +150,7 @@ test:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -f $(OBJS) *.mps.o voxtral_metal.o *.cuda.o voxtral_cuda.o main.o inspect_weights.o $(TARGET) inspect_weights
 	rm -f voxtral_shaders_source.h
 
 info:
@@ -141,6 +165,7 @@ ifeq ($(UNAME_M),arm64)
 endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
+	@echo "  cuda    - NVIDIA GPU with cuBLAS (requires CUDA toolkit, SM 8.0+)"
 endif
 
 # =============================================================================
@@ -155,4 +180,5 @@ voxtral_tokenizer.o: voxtral_tokenizer.c voxtral_tokenizer.h
 voxtral_safetensors.o: voxtral_safetensors.c voxtral_safetensors.h
 main.o: main.c voxtral.h voxtral_kernels.h voxtral_mic.h
 voxtral_mic_macos.o: voxtral_mic_macos.c voxtral_mic.h
+voxtral_cuda.o: voxtral_cuda.cu voxtral_cuda.h
 inspect_weights.o: inspect_weights.c voxtral_safetensors.h
