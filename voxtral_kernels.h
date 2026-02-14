@@ -160,5 +160,6 @@ void vox_apply_rope(float *x, const float *freqs, int seq, int heads, int head_d
 
 /* Global verbose flag */
 extern int vox_verbose;
+extern int vox_monitor;
 
 #endif /* VOXTRAL_KERNELS_H */

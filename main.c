@@ -35,6 +35,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nOptions:\n");
     fprintf(stderr, "  -I <secs>     Encoder processing interval in seconds (default: 2.0)\n");
     fprintf(stderr, "  --alt <c>     Show alternative tokens within cutoff distance (0.0-1.0)\n");
+    fprintf(stderr, "  --monitor     Show non-intrusive symbols inline with output (stderr)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer, per-chunk details)\n");
     fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -145,6 +146,9 @@ int main(int argc, char **argv) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--from-mic") == 0) {
             use_mic = 1;
+        } else if (strcmp(argv[i], "--monitor") == 0) {
+            extern int vox_monitor;
+            vox_monitor = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -196,6 +200,10 @@ int main(int argc, char **argv) {
         if (feed_chunk < 160) feed_chunk = 160;
         if (feed_chunk > DEFAULT_FEED_CHUNK) feed_chunk = DEFAULT_FEED_CHUNK;
     }
+
+    /* Enable continuous mode for live sources (auto-restart decoder) */
+    if (use_mic || use_stdin)
+        vox_stream_set_continuous(s, 1);
 
     if (use_mic) {
         /* Microphone capture with silence cancellation */

@@ -51,11 +51,19 @@ int vox_mel_feed(vox_mel_ctx_t *ctx, const float *samples, int n_samples);
 
 /* Finalize: append right_pad_samples zeros, then 200-sample right reflect
  * padding, compute remaining frames, drop last frame (vLLM convention).
- * Returns total frame count after finalization. */
+ * Returns number of available mel frames. */
 int vox_mel_finish(vox_mel_ctx_t *ctx, int right_pad_samples);
 
-/* Get pointer to mel buffer and total frame count. */
+/* Get pointer to mel buffer and available frame count. */
 float *vox_mel_data(vox_mel_ctx_t *ctx, int *out_n_frames);
+
+/* Global mel frame index corresponding to mel_data()[0].
+ * Needed when the context compacts old frames in long-running streams. */
+int vox_mel_frame_offset(vox_mel_ctx_t *ctx);
+
+/* Discard mel frames with global index < keep_from_frame.
+ * Keeps memory bounded in non-stop streams. */
+void vox_mel_discard_before(vox_mel_ctx_t *ctx, int keep_from_frame);
 
 /* Free incremental mel context. */
 void vox_mel_free(vox_mel_ctx_t *ctx);

@@ -414,15 +414,40 @@ struct vox_mel_ctx {
     float *samples;
     int n_samples;          /* current length of samples buffer */
     int samples_cap;
+    int64_t sample_offset;  /* global sample index of samples[0] */
 
     /* Mel frame buffer (growing) */
     float *mel;
-    int n_mel_frames;       /* frames computed so far */
+    int n_mel_frames;       /* currently available frames in mel[] */
     int mel_cap;            /* allocated frame capacity */
+    int mel_frame_offset;   /* global frame index of mel[0] */
 
     int left_pad;           /* total left padding = 200 + left_pad_samples */
     int finished;           /* set by vox_mel_finish */
 };
+
+#define MEL_SAMPLE_COMPACT_MIN 16000 /* compact every ~1s of audio progress */
+
+/* Drop old audio samples that can no longer contribute to future mel frames. */
+static void mel_compact_samples(vox_mel_ctx_t *ctx) {
+    if (!ctx || ctx->n_samples <= WIN_LENGTH) return;
+
+    int64_t next_frame_global = (int64_t)ctx->mel_frame_offset + ctx->n_mel_frames;
+    int64_t needed_from_global = next_frame_global * HOP_LENGTH;
+    int64_t discard64 = needed_from_global - ctx->sample_offset;
+    if (discard64 <= 0) return;
+
+    int discard = (discard64 > ctx->n_samples) ? ctx->n_samples : (int)discard64;
+    if (discard < MEL_SAMPLE_COMPACT_MIN &&
+        ctx->n_samples < (ctx->samples_cap * 3) / 4) return;
+
+    int remain = ctx->n_samples - discard;
+    if (remain > 0) {
+        memmove(ctx->samples, ctx->samples + discard, (size_t)remain * sizeof(float));
+    }
+    ctx->n_samples = remain;
+    ctx->sample_offset += discard;
+}
 
 /* Compute mel frames for all windows that fit in available data.
  * Each frame t needs samples[t*HOP_LENGTH .. t*HOP_LENGTH + WIN_LENGTH - 1]. */
@@ -433,9 +458,12 @@ static int mel_compute_available(vox_mel_ctx_t *ctx) {
 
     while (1) {
         int t = ctx->n_mel_frames;
-        int start = t * HOP_LENGTH;
-        int end = start + WIN_LENGTH;
-        if (end > ctx->n_samples) break;
+        int64_t t_global = (int64_t)ctx->mel_frame_offset + t;
+        int64_t start_global = t_global * HOP_LENGTH;
+        int64_t start64 = start_global - ctx->sample_offset;
+        int64_t end64 = start64 + WIN_LENGTH;
+        if (start64 < 0 || end64 > ctx->n_samples) break;
+        int start = (int)start64;
 
         /* Ensure mel buffer capacity */
         if (t >= ctx->mel_cap) {
@@ -548,7 +576,9 @@ int vox_mel_feed(vox_mel_ctx_t *ctx, const float *samples, int n_samples) {
     ctx->n_samples += n_samples;
 
     /* Compute all new mel frames that fit */
-    return mel_compute_available(ctx);
+    int n_new = mel_compute_available(ctx);
+    mel_compact_samples(ctx);
+    return n_new;
 }
 
 int vox_mel_finish(vox_mel_ctx_t *ctx, int right_pad_samples) {
@@ -606,6 +636,29 @@ float *vox_mel_data(vox_mel_ctx_t *ctx, int *out_n_frames) {
     if (!ctx) { if (out_n_frames) *out_n_frames = 0; return NULL; }
     if (out_n_frames) *out_n_frames = ctx->n_mel_frames;
     return ctx->mel;
+}
+
+int vox_mel_frame_offset(vox_mel_ctx_t *ctx) {
+    return ctx ? ctx->mel_frame_offset : 0;
+}
+
+void vox_mel_discard_before(vox_mel_ctx_t *ctx, int keep_from_frame) {
+    if (!ctx) return;
+    if (keep_from_frame <= ctx->mel_frame_offset) return;
+
+    int discard = keep_from_frame - ctx->mel_frame_offset;
+    if (discard > ctx->n_mel_frames) discard = ctx->n_mel_frames;
+    if (discard <= 0) return;
+
+    int remain = ctx->n_mel_frames - discard;
+    if (remain > 0) {
+        memmove(ctx->mel, ctx->mel + (size_t)discard * N_MEL,
+                (size_t)remain * N_MEL * sizeof(float));
+    }
+    ctx->n_mel_frames = remain;
+    ctx->mel_frame_offset += discard;
+
+    mel_compact_samples(ctx);
 }
 
 void vox_mel_free(vox_mel_ctx_t *ctx) {

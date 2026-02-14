@@ -102,6 +102,21 @@ The default is 2.0 seconds. Lower values make streaming more responsive (text ap
 
 The overhead is significant: on a 60-second clip, batch mode takes ~2.9s for the encoder, while `-I 0.1` takes ~15.8s (5.4x slower) because of hundreds of small encoder calls each paying the fixed cost. For **real-time streaming**, values between 1.0 and 2.0 work well. Going below 0.5 wastes most of the GPU time on per-call overhead. For **offline file transcription** the interval is irrelevant since all audio is available at once.
 
+### Monitor Mode (`--monitor`)
+
+The `--monitor` flag prints non-intrusive unicode symbols to stderr, inline with the transcription output, showing what the engine is doing in real time. Useful for diagnosing latency issues or verifying that the pipeline is running smoothly.
+
+| Symbol | Meaning |
+|--------|---------|
+| `▶` | Encoder processed a chunk of audio |
+| `·` | Decoder prefill (initial prompt injection) |
+| `▪` | Decoder generated a batch of tokens (normal speed) |
+| `▸` | Decoder generated a batch of tokens (slow, >40ms/step) |
+| `↺` | Decoder restarted after end-of-sequence |
+| `⟳` | Decoder restarted due to KV cache overflow |
+
+A healthy stream looks like `▶·▪▪▶▪▪▶▪▪` — encoder chunks interleaved with fast decode batches. If you see `▸` symbols appearing frequently, the decoder is falling behind real-time. The restart symbols (`↺`, `⟳`) are normal during long continuous streams.
+
 ### Reading Audio from Stdin
 
 The **`--stdin` flag** reads audio from standard input instead of a file. The format is auto-detected: if the data starts with a RIFF header it is parsed as WAV, otherwise it is treated as **raw signed 16-bit little-endian, 16 kHz, mono** (`s16le`).
@@ -115,6 +130,11 @@ ffmpeg -i podcast.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 
 # Pipe a WAV directly (auto-detected)
 cat recording.wav | ./voxtral -d voxtral-model --stdin
+
+# Live transcription of a web radio stream
+curl -sL http://stream.live.vc.bbcmedia.co.uk/bbc_world_service | \
+    ffmpeg -i pipe:0 -ar 16000 -ac 1 -f wav pipe:1 2>/dev/null | \
+    ./voxtral -d voxtral-model --stdin
 ```
 
 ### Live Microphone Input

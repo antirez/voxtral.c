@@ -275,6 +275,12 @@ int vox_stream_get_alt(vox_stream_t *s, const char **out_tokens,
  * finish() always processes all remaining data regardless. */
 void vox_set_processing_interval(vox_stream_t *s, float seconds);
 
+/* Enable continuous (live) mode: auto-restart decoder on EOS, KV overflow,
+ * or prolonged non-text decode streaks. Restarts are hard resets (no decoder
+ * context carry-over). Without this, EOS ends decoding and KV grows unbounded
+ * (fine for finite files). */
+void vox_stream_set_continuous(vox_stream_t *s, int enable);
+
 /* Force the encoder to process whatever audio is buffered, regardless of the
  * processing interval. Useful for flushing on silence detection. */
 int vox_stream_flush(vox_stream_t *s);
