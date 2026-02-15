@@ -110,12 +110,24 @@ The `--monitor` flag prints non-intrusive unicode symbols to stderr, inline with
 |--------|---------|
 | `▶` | Encoder processed a chunk of audio |
 | `·` | Decoder prefill (initial prompt injection) |
+| `⌛` | Decoder waiting for enough adapter tokens to prefill |
 | `▪` | Decoder generated a batch of tokens (normal speed) |
 | `▸` | Decoder generated a batch of tokens (slow, >40ms/step) |
+| `▫` | Decoder generated control tokens only (token id < 1000, normal speed) |
+| `▹` | Decoder generated control tokens only (slow, >40ms/step) |
+| `✗` | Decoder generated invalid text-range tokens (empty/invalid decode, normal speed) |
+| `✘` | Decoder generated invalid text-range tokens (slow, >40ms/step) |
+| `⚠` | Elevated non-text streak (appended to control/invalid decode symbols) |
+| `☠` | Critical non-text streak, restart imminent (appended to control/invalid decode symbols) |
+| `◦` | EOS-only decode step |
 | `↺` | Decoder restarted after end-of-sequence |
 | `⟳` | Decoder restarted due to KV cache overflow |
+| `↯` | Decoder restarted due to non-text stall |
+| `⌚` | Decoder restarted due to no-decode watchdog timeout |
+| `✂` | Decoder-only hard reset |
+| `♻` | Full stream reset (mel + encoder + decoder state) |
 
-A healthy stream looks like `▶·▪▪▶▪▪▶▪▪` — encoder chunks interleaved with fast decode batches. If you see `▸` symbols appearing frequently, the decoder is falling behind real-time. The restart symbols (`↺`, `⟳`) are normal during long continuous streams.
+A healthy stream looks like `▶·▪▪▶▪▪▶▪▪` — encoder chunks interleaved with fast decode batches. If `▸`, `▹`, `⚠`, or `☠` appear frequently, decode is under stress. Restart symbols are normal in long continuous streams; you will typically see pairs like `↺✂`, `⟳♻`, `↯♻`, or `⌚♻`.
 
 ### Reading Audio from Stdin
 
