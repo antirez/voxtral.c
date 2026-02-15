@@ -2,7 +2,7 @@
 
 This is a C implementation of the inference pipeline for the [Mistral AI's Voxtral Realtime 4B model](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602). It has zero external dependencies beyond the C standard library. The MPS inference is decently fast, while the BLAS acceleration is usable but slow (it continuously convert the bf16 weights to fp32).
 
-Audio processing uses a chunked encoder with overlapping windows, bounding memory usage regardless of input length. Audio can also be piped from stdin (`--stdin`), or captured live from the microphone (`--from-mic`, macOS), making it easy to transcode and transcribe any format via ffmpeg. A streaming C API (`vox_stream_t`) lets you feed audio incrementally and receive token strings as they become available.
+Audio processing uses a chunked encoder with overlapping windows, bounding memory usage regardless of input length. Audio can also be piped from stdin (`--stdin`), or captured live from the microphone (`--from-mic`, macOS and GNU/Linux), making it easy to transcode and transcribe any format via ffmpeg. A streaming C API (`vox_stream_t`) lets you feed audio incrementally and receive token strings as they become available.
 
 **More testing needed:** please note that this project was mostly tested against few samples, and likely requires some more work to be production quality. However the hard part, to understand the model inference and reproduce the inference pipeline, is here, so the rest likely can be done easily. Testing it against very long transcriptions, able to stress the KV cache circular buffer, will be a useful task.
 
@@ -25,7 +25,7 @@ make mps       # Apple Silicon (fastest)
 # Transcribe audio (tokens stream to stdout as generated)
 ./voxtral -d voxtral-model -i audio.wav
 
-# Live microphone transcription (macOS, Ctrl+C to stop)
+# Live microphone transcription (macOS and GNU/Linux, Ctrl+C to stop)
 ./voxtral -d voxtral-model --from-mic
 
 # Pipe any format via ffmpeg
@@ -57,7 +57,7 @@ This requires just PyTorch and a few standard libraries.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word.
 - **Streaming C API**: Feed audio incrementally, get token strings back as they become available.
 - **Memory-mapped weights**: BF16 weights are mmap'd directly from safetensors, loading is near-instant.
-- **Live microphone input**: `--from-mic` captures and transcribes from the default microphone (macOS) with automatic silence detection.
+- **Live microphone input**: `--from-mic` captures and transcribes from the default microphone (macOS and GNU/Linux) with automatic silence detection.
 - **WAV input**: Supports 16-bit PCM WAV files at any sample rate (auto-resampled to 16kHz).
 - **Chunked encoder**: Processes audio in overlapping chunks, bounding memory regardless of length.
 - **Rolling KV cache**: Decoder KV cache is automatically compacted when it exceeds the sliding window (8192 positions), capping memory usage and allowing unlimited-length audio.
@@ -151,12 +151,20 @@ curl -sL http://stream.live.vc.bbcmedia.co.uk/bbc_world_service | \
 
 ### Live Microphone Input
 
-The **`--from-mic` flag** captures audio from the default microphone (macOS only, uses AudioQueue Services). Press Ctrl+C to stop. Silence is automatically detected and stripped to reduce encoder/decoder work when you pause speaking — only actual speech is processed.
+The **`--from-mic` flag** captures audio from the default microphone (macOS AudioQueue Services, GNU/Linux ALSA). Press Ctrl+C to stop. Silence is automatically detected and stripped to reduce encoder/decoder work when you pause speaking — only actual speech is processed.
 
 ```bash
 ./voxtral -d voxtral-model --from-mic                # default 2s processing interval
 ./voxtral -d voxtral-model --from-mic -I 1.0          # lower latency
 ./voxtral -d voxtral-model --from-mic --silent         # no stderr status
+```
+For GNU/Linux systems make sure to have ALSA development libraries, otherwise:
+
+```bash
+# Ubuntu/Debian
+sudo apt install libasound2 libasound2-dev
+# Fedora
+sudo dnf install alsa-lib alsa-lib-devel
 ```
 
 If the model falls behind real-time, a warning is printed and audio is skipped to catch up.
@@ -297,6 +305,7 @@ Other targets:
 make clean      # Clean build artifacts
 make info       # Show available backends for this platform
 make inspect    # Build safetensors weight inspector
+make mic_test   # Build microphone backends test (macOS and GNU/Linux)
 ```
 
 ## Model Download

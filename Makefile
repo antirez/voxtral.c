@@ -50,9 +50,10 @@ SRCS += voxtral_mic_macos.c
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate -framework AudioToolbox -framework CoreFoundation
 else
+SRCS += voxtral_mic_linux.c
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_OPENBLAS -I/usr/include/openblas
-blas: LDFLAGS += -lopenblas
-SRCS += voxtral_mic_macos.c
+blas: LDFLAGS += -lopenblas -lasound -lpthread
+#SRCS += voxtral_mic_macos.c
 endif
 blas: clean $(TARGET)
 	@echo ""
@@ -123,10 +124,24 @@ test:
 	@./runtest.sh
 
 # =============================================================================
+# Mic backends test (macOS CoreAudio / Linux ALSA)
+# =============================================================================
+mic_test: voxtral_mic_test.c voxtral_mic_macos.o voxtral_mic_linux.o
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS_BASE) -o mic_test voxtral_mic_test.c voxtral_mic_macos.o \
+		-framework AudioToolbox -framework CoreFoundation -lpthread -lm
+else
+	$(CC) $(CFLAGS_BASE) -o mic_test voxtral_mic_test.c voxtral_mic_linux.o \
+		-lasound -lpthread -lm
+endif
+	@echo "Built mic_test for $(UNAME_S)"
+
+# =============================================================================
 # Utilities
 # =============================================================================
 clean:
 	rm -f $(OBJS) *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -rf voxtral_mic_macos.o voxtral_mic_linux.o mic_test
 	rm -f voxtral_shaders_source.h
 
 info:
@@ -155,4 +170,5 @@ voxtral_tokenizer.o: voxtral_tokenizer.c voxtral_tokenizer.h
 voxtral_safetensors.o: voxtral_safetensors.c voxtral_safetensors.h
 main.o: main.c voxtral.h voxtral_kernels.h voxtral_mic.h
 voxtral_mic_macos.o: voxtral_mic_macos.c voxtral_mic.h
+voxtral_mic_linux.o: voxtral_mic_linux.c voxtral_mic.h
 inspect_weights.o: inspect_weights.c voxtral_safetensors.h
