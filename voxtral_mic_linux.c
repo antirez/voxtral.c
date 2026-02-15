@@ -74,7 +74,7 @@ static void *mic_capture_thread(void *arg) {
 
 
 /* Errors checking helper func */
-static int snd_check(int err, const char *msg) {
+static int alsa_errcheck(int err, const char *msg) {
     if(err < 0) {
         fprintf(stderr, "%s: %s\n", msg, snd_strerror(err));
         return -1;
@@ -93,34 +93,34 @@ int vox_mic_start(void) {
 
     /* Open ALSA pcm_handle for capture */
     err = snd_pcm_open(&pcm_handle, "default", SND_PCM_STREAM_CAPTURE, 0);
-    if (snd_check(err, "snd_pcm_open failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_open failed")) goto fail;
 
     /* Allocate and initialize hw_params with ALSA default configuration */
     snd_pcm_hw_params_alloca(&hw_params);
     err = snd_pcm_hw_params_any(pcm_handle, hw_params);
-    if (snd_check(err, "snd_pcm_hw_params_any failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_hw_params_any failed")) goto fail;
 
     /* Set ACCESS param to INTERLEAVED */
     err = snd_pcm_hw_params_set_access(pcm_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
-    if (snd_check(err, "snd_pcm_hw_params_set_access failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_hw_params_set_access failed")) goto fail;
 
     /* Set CHANNELS param to MONO */
     err = snd_pcm_hw_params_set_channels(pcm_handle, hw_params, 1);
-    if (snd_check(err, "snd_pcm_hw_params_set_channels failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_hw_params_set_channels failed")) goto fail;
 
     /* Set FORMAT param to S16LE */
     err = snd_pcm_hw_params_set_format(pcm_handle, hw_params, SND_PCM_FORMAT_S16_LE);
-    if (snd_check(err, "snd_pcm_hw_params_set_format failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_hw_params_set_format failed")) goto fail;
 
     /* Set PERIOD SIZE (number of frames per read) to MIC_BUF_FRAMES */
     snd_pcm_uframes_t period_size = MIC_BUF_FRAMES;
     err = snd_pcm_hw_params_set_period_size_near(pcm_handle, hw_params, &period_size, NULL);
-    if (snd_check(err, "snd_pcm_hw_params_set_period_size_near failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_hw_params_set_period_size_near failed")) goto fail;
 
     /* Set RATE param to 16kHz (mandatory for Voxtral) */
     unsigned int rate = MIC_SAMPLE_RATE;
     err = snd_pcm_hw_params_set_rate_near(pcm_handle, hw_params, &rate, NULL);
-    if (snd_check(err, "snd_pcm_hw_params_set_rate_near failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_hw_params_set_rate_near failed")) goto fail;
     if (rate != MIC_SAMPLE_RATE) {
         fprintf(stderr, "Your audio pcm_handle does not support 16000 Hz\n");
         goto fail;
@@ -128,11 +128,11 @@ int vox_mic_start(void) {
 
     /* Finally commit all previous params settings to the ALSA pcm_handle */
     err = snd_pcm_hw_params(pcm_handle, hw_params);
-    if (snd_check(err, "snd_pcm_hw_params failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_hw_params failed")) goto fail;
 
     /* Set the ALSA pcm_handle as ready */
     err = snd_pcm_prepare(pcm_handle);
-    if (snd_check(err, "snd_pcm_prepare failed")) goto fail;
+    if (alsa_errcheck(err, "snd_pcm_prepare failed")) goto fail;
 
     /* Init ring buffer */
     pthread_mutex_lock(&ring_mutex);
