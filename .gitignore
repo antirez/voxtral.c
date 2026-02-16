@@ -4,3 +4,4 @@ voxtral-model/
 pyenv*/
 misc/
 *.o
+result
