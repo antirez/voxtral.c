@@ -147,7 +147,17 @@ cat recording.wav | ./voxtral -d voxtral-model --stdin
 curl -sL http://stream.live.vc.bbcmedia.co.uk/bbc_world_service | \
     ffmpeg -i pipe:0 -ar 16000 -ac 1 -f wav pipe:1 2>/dev/null | \
     ./voxtral -d voxtral-model --stdin
+
+# Transcribe a YouTube video via yt-dlp (requires yt-dlp and ffmpeg)
+yt-dlp --quiet --no-warnings -x -o - "https://www.youtube.com/watch?v=VIDEOID" | \
+    ffmpeg -i pipe:0 -ar 16000 -ac 1 -f wav pipe:1 2>/dev/null | \
+    ./voxtral -d voxtral-model --stdin
 ```
+
+> **Note:** `yt-dlp -o -` outputs the raw audio container (e.g. WebM/Opus).
+> You must pass it through `ffmpeg` to convert to the 16 kHz mono WAV that voxtral expects.
+> Direct piping of `--audio-format wav` from yt-dlp does not work because yt-dlp cannot
+> seek the stream when writing a WAV header; the ffmpeg intermediate step is required.
 
 ### Live Microphone Input
 
