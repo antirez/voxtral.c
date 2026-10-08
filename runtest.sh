@@ -97,7 +97,10 @@ run_test() {
 # Test 1: Batch mode (whole file at once)
 run_test "batch" $VOXTRAL -d "$MODEL_DIR" -i "$TMPWAV"
 
-# Test 2: Streaming mode with small chunks (exercises KV cache compaction)
+# Test 2: A large interval must retain the beginning, middle, and end of the clip.
+run_test "batch -I 120" $VOXTRAL -d "$MODEL_DIR" -i "$TMPWAV" -I 120
+
+# Test 3: Streaming mode with small chunks (exercises KV cache compaction)
 run_test "streaming -I 0.1" \
     bash -c "ffmpeg -i '$OGG' -f s16le -ar 16000 -ac 1 - 2>/dev/null | $VOXTRAL -d $MODEL_DIR --stdin -I 0.1"
 

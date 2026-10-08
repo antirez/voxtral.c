@@ -370,6 +370,13 @@ void vox_free(vox_ctx_t *ctx) {
 /* First chunk minimum mel frames (enough for 39 prompt adapter tokens) */
 #define STREAM_FIRST_CHUNK_MIN_MEL  312
 
+/* Most mel frames handed to the encoder in one pass. The encoder KV cache is
+ * preallocated in shared GPU memory and cannot grow, so it must hold the
+ * sliding window plus the positions being added. Two mel frames make one
+ * encoder position, so this bound keeps 750 + new_mel/2 inside that cache.
+ * Larger pending backlogs are processed in several passes. */
+#define STREAM_MAX_CHUNK_MEL  400
+
 /* Default processing interval in seconds (mel rate = 100 fps) */
 #define STREAM_DEFAULT_INTERVAL  2.0f
 
@@ -780,7 +787,9 @@ static int stream_reset_full_state(vox_stream_t *s) {
 }
 
 /* Run encoder incrementally on available mel, append adapter tokens */
-static void stream_run_encoder(vox_stream_t *s) {
+/* Processes one bounded slice of pending mel. Returns 1 if a slice was
+ * consumed and more may remain, 0 when there is nothing left to do. */
+static int stream_run_encoder_slice(vox_stream_t *s) {
     int mel_frames = 0;
     int mel_offset = vox_mel_frame_offset(s->mel_ctx);
     float *mel_data = vox_mel_data(s->mel_ctx, &mel_frames);
@@ -792,8 +801,11 @@ static void stream_run_encoder(vox_stream_t *s) {
     int new_mel = total_mel - s->mel_cursor;
     int need_mel = (!s->conv_stem_initialized) ? STREAM_FIRST_CHUNK_MIN_MEL : s->min_new_mel;
 
-    if (new_mel < need_mel && !s->finished) return;
-    if (new_mel <= 0) return;
+    if (new_mel < need_mel && !s->finished) return 0;
+    if (new_mel <= 0) return 0;
+
+    /* Cap the slice so the encoder KV cache can hold window + new positions. */
+    if (new_mel > STREAM_MAX_CHUNK_MEL) new_mel = STREAM_MAX_CHUNK_MEL;
 
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
@@ -802,12 +814,12 @@ static void stream_run_encoder(vox_stream_t *s) {
     int conv_out_len = 0;
     float *conv_out = stream_conv_stem(s, mel_data + (size_t)mel_start * VOX_MEL_BINS,
                                         new_mel, &conv_out_len);
-    s->mel_cursor = total_mel;
+    s->mel_cursor += new_mel;
 
     if (!conv_out || conv_out_len <= 0) {
         free(conv_out);
         vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
-        return;
+        return 1;
     }
 
     /* 2. Run incremental encoder transformer with KV cache */
@@ -818,7 +830,7 @@ static void stream_run_encoder(vox_stream_t *s) {
     if (!enc_out || enc_out_len <= 0) {
         free(enc_out);
         vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
-        return;
+        return 1;
     }
 
     /* 3. Combine with residual, align to 4x for downsample */
@@ -863,7 +875,7 @@ static void stream_run_encoder(vox_stream_t *s) {
                     free(adapter_chunk);
                     free(enc_out);
                     vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
-                    return;
+                    return 1;
                 }
                 s->adapter_buf = tmp;
                 s->adapter_cap = new_cap;
@@ -904,6 +916,13 @@ static void stream_run_encoder(vox_stream_t *s) {
                 new_mel, conv_out_len, usable, s->total_adapter, leftover);
 
     vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
+    return 1;
+}
+
+/* Drains all pending mel through the encoder, a bounded slice at a time. */
+static void stream_run_encoder(vox_stream_t *s) {
+    while (stream_run_encoder_slice(s))
+        ;
 }
 
 /* Build alternatives array from logits. alts[0]=best (already decoded as best_token).
