@@ -25,6 +25,10 @@ int vox_metal_available(void);
 /* Cleanup all Metal resources. */
 void vox_metal_shutdown(void);
 
+/* Drop the cached GPU copy of a host buffer that has been rewritten in place.
+ * Pass size 0 to match the pointer regardless of length. */
+void vox_metal_invalidate_weight(const void *cpu_ptr, size_t size);
+
 /*
  * GPU-accelerated matrix multiplication with bf16 weights.
  * C[M,N] = alpha * A[M,K] @ B^T[N,K] + beta * C[M,N]

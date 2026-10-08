@@ -76,6 +76,11 @@ static void vox_update_time_conditioning(vox_ctx_t *ctx) {
             for (int j = 0; j < VOX_ADA_NORM_DIM; j++) sum += row[j] * hidden[j];
             scale[i] = sum;
         }
+#ifdef USE_METAL
+        /* ada_scale is rewritten in place, so any GPU copy taken for a previous
+         * delay is now stale. */
+        vox_metal_invalidate_weight(scale, VOX_DEC_DIM * sizeof(float));
+#endif
     }
 }
 

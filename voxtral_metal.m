@@ -290,6 +290,24 @@ static id<MTLBuffer> get_cached_weight_buffer(const float *weights, size_t size)
     return buf;
 }
 
+/* Drop the cached GPU copy of a host buffer whose contents have changed.
+ * The cache is keyed by host pointer, so a buffer rewritten in place would
+ * otherwise keep serving the values captured on first use. */
+void vox_metal_invalidate_weight(const void *cpu_ptr, size_t size) {
+    if (!g_device || !cpu_ptr) return;
+    pthread_mutex_lock(&g_cache_mutex);
+    for (int i = 0; i < g_weight_cache_count; i++) {
+        if (g_weight_cache[i].cpu_ptr != cpu_ptr) continue;
+        if (size && g_weight_cache[i].size != size) continue;
+        g_weight_cache[i] = g_weight_cache[g_weight_cache_count - 1];
+        g_weight_cache[g_weight_cache_count - 1].gpu_buffer = nil;
+        g_weight_cache[g_weight_cache_count - 1].cpu_ptr = NULL;
+        g_weight_cache_count--;
+        i--;
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
 static void clear_weight_cache(void) {
     pthread_mutex_lock(&g_cache_mutex);
     for (int i = 0; i < g_weight_cache_count; i++) {
