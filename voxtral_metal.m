@@ -47,6 +47,13 @@ static id<MTLComputePipelineState> g_kv_cache_copy_pipeline = nil;
 static id<MTLComputePipelineState> g_kv_cache_copy_f16_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_attention_pipeline = nil;
 static id<MTLComputePipelineState> g_decoder_attention_f16_pipeline = nil;
+static id<MTLComputePipelineState> g_decoder_attention_split_pipeline = nil;
+static id<MTLComputePipelineState> g_decoder_attention_combine_pipeline = nil;
+/* Scratch for split-KV attention partials, grown on demand. */
+static id<MTLBuffer> g_attn_part_acc = nil;
+static id<MTLBuffer> g_attn_part_max = nil;
+static id<MTLBuffer> g_attn_part_sum = nil;
+static int g_attn_part_splits = 0;
 static id<MTLComputePipelineState> g_encoder_attention_pipeline = nil;
 static id<MTLComputePipelineState> g_encoder_attention_kv_f16_pipeline = nil;
 static id<MTLComputePipelineState> g_bias_add_pipeline = nil;
@@ -487,6 +494,10 @@ static int init_shaders(void) {
 
         func = [g_shader_library newFunctionWithName:@"decoder_attention_f16"];
         if (func) g_decoder_attention_f16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        func = [g_shader_library newFunctionWithName:@"decoder_attention_f16_split"];
+        if (func) g_decoder_attention_split_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        func = [g_shader_library newFunctionWithName:@"decoder_attention_combine"];
+        if (func) g_decoder_attention_combine_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
 
         func = [g_shader_library newFunctionWithName:@"encoder_attention"];
         if (func) g_encoder_attention_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
@@ -619,6 +630,12 @@ void vox_metal_shutdown(void) {
         g_kv_cache_copy_f16_pipeline = nil;
         g_decoder_attention_pipeline = nil;
         g_decoder_attention_f16_pipeline = nil;
+        g_decoder_attention_split_pipeline = nil;
+        g_decoder_attention_combine_pipeline = nil;
+        g_attn_part_acc = nil;
+        g_attn_part_max = nil;
+        g_attn_part_sum = nil;
+        g_attn_part_splits = 0;
         g_encoder_attention_pipeline = nil;
         g_encoder_attention_kv_f16_pipeline = nil;
         g_bias_add_pipeline = nil;
@@ -2440,6 +2457,39 @@ static id<MTLBuffer> find_shared_buffer(void *ptr) {
 
 #include "voxtral.h"
 
+/* Keys per chunk for split-KV attention. Chosen so a short cache keeps the
+ * single-pass kernel (no merge overhead) and a long one spreads across the
+ * GPU instead of running 32 threadgroups back to back. */
+#define ATTN_SPLIT_CHUNK 512
+#define ATTN_SPLIT_MIN   1024
+#define ATTN_SPLIT_MAX   32
+
+static int attn_split_count(int span) {
+    if (span < ATTN_SPLIT_MIN) return 1;
+    int n = (span + ATTN_SPLIT_CHUNK - 1) / ATTN_SPLIT_CHUNK;
+    if (n > ATTN_SPLIT_MAX) n = ATTN_SPLIT_MAX;
+    return n < 1 ? 1 : n;
+}
+
+static int ensure_attn_partials(int splits, int n_heads, int head_dim) {
+    if (splits <= g_attn_part_splits && g_attn_part_acc) return 1;
+    size_t acc_bytes = (size_t)n_heads * splits * head_dim * sizeof(float);
+    size_t sc_bytes  = (size_t)n_heads * splits * sizeof(float);
+    g_attn_part_acc = [g_device newBufferWithLength:acc_bytes
+                                            options:MTLResourceStorageModeShared];
+    g_attn_part_max = [g_device newBufferWithLength:sc_bytes
+                                            options:MTLResourceStorageModeShared];
+    g_attn_part_sum = [g_device newBufferWithLength:sc_bytes
+                                            options:MTLResourceStorageModeShared];
+    if (!g_attn_part_acc || !g_attn_part_max || !g_attn_part_sum) {
+        g_attn_part_acc = nil; g_attn_part_max = nil; g_attn_part_sum = nil;
+        g_attn_part_splits = 0;
+        return 0;
+    }
+    g_attn_part_splits = splits;
+    return 1;
+}
+
 int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *logits_out) {
     if (!g_initialized || !g_shaders_initialized || !g_dec_x) return -1;
 
@@ -2594,23 +2644,71 @@ int vox_metal_decoder_full_step(void *ctx_ptr, const float *rope_freqs, float *l
                 /* Barrier: KV cache must be written before attention reads it */
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-                /* Single-token attention (Q from bufQKV at offset 0) */
-                [enc setComputePipelineState:kv_fp16 ?
-                    g_decoder_attention_f16_pipeline : g_decoder_attention_pipeline];
-                [enc setBuffer:bufQKV offset:0 atIndex:0];
-                [enc setBuffer:gpu_kv_k offset:layer_kv_offset atIndex:1];
-                [enc setBuffer:gpu_kv_v offset:layer_kv_offset atIndex:2];
-                [enc setBuffer:bufAttn offset:0 atIndex:3];
-                [enc setBytes:&n_heads length:sizeof(int) atIndex:4];
-                [enc setBytes:&n_kv_heads length:sizeof(int) atIndex:5];
-                [enc setBytes:&head_dim length:sizeof(int) atIndex:6];
-                [enc setBytes:&kv_dim length:sizeof(int) atIndex:7];
-                [enc setBytes:&total_seq length:sizeof(int) atIndex:8];
-                [enc setBytes:&scale length:sizeof(float) atIndex:9];
-                [enc setBytes:&window length:sizeof(int) atIndex:10];
-                [enc setBytes:&q_pos_val length:sizeof(int) atIndex:11];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                /* Single-token attention (Q from bufQKV at offset 0).
+                 * One threadgroup per head walks the whole cache serially, so
+                 * for a long cache split the key range across many groups and
+                 * merge the partial softmaxes. */
+                int span = MIN(total_seq, q_pos_val + 1);
+                if (window > 0 && span > window) span = window;
+                int splits = (kv_fp16 && g_decoder_attention_split_pipeline &&
+                              g_decoder_attention_combine_pipeline)
+                             ? attn_split_count(span) : 1;
+
+                if (splits > 1) {
+                    if (!ensure_attn_partials(splits, n_heads, head_dim))
+                        splits = 1;
+                }
+
+                if (splits > 1) {
+                    [enc setComputePipelineState:g_decoder_attention_split_pipeline];
+                    [enc setBuffer:bufQKV offset:0 atIndex:0];
+                    [enc setBuffer:gpu_kv_k offset:layer_kv_offset atIndex:1];
+                    [enc setBuffer:gpu_kv_v offset:layer_kv_offset atIndex:2];
+                    [enc setBuffer:g_attn_part_acc offset:0 atIndex:3];
+                    [enc setBuffer:g_attn_part_max offset:0 atIndex:4];
+                    [enc setBuffer:g_attn_part_sum offset:0 atIndex:5];
+                    [enc setBytes:&n_heads length:sizeof(int) atIndex:6];
+                    [enc setBytes:&n_kv_heads length:sizeof(int) atIndex:7];
+                    [enc setBytes:&head_dim length:sizeof(int) atIndex:8];
+                    [enc setBytes:&kv_dim length:sizeof(int) atIndex:9];
+                    [enc setBytes:&total_seq length:sizeof(int) atIndex:10];
+                    [enc setBytes:&scale length:sizeof(float) atIndex:11];
+                    [enc setBytes:&window length:sizeof(int) atIndex:12];
+                    [enc setBytes:&q_pos_val length:sizeof(int) atIndex:13];
+                    [enc setBytes:&splits length:sizeof(int) atIndex:14];
+                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_heads * splits), 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    [enc setComputePipelineState:g_decoder_attention_combine_pipeline];
+                    [enc setBuffer:g_attn_part_acc offset:0 atIndex:0];
+                    [enc setBuffer:g_attn_part_max offset:0 atIndex:1];
+                    [enc setBuffer:g_attn_part_sum offset:0 atIndex:2];
+                    [enc setBuffer:bufAttn offset:0 atIndex:3];
+                    [enc setBytes:&n_heads length:sizeof(int) atIndex:4];
+                    [enc setBytes:&head_dim length:sizeof(int) atIndex:5];
+                    [enc setBytes:&splits length:sizeof(int) atIndex:6];
+                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                } else {
+                    [enc setComputePipelineState:kv_fp16 ?
+                        g_decoder_attention_f16_pipeline : g_decoder_attention_pipeline];
+                    [enc setBuffer:bufQKV offset:0 atIndex:0];
+                    [enc setBuffer:gpu_kv_k offset:layer_kv_offset atIndex:1];
+                    [enc setBuffer:gpu_kv_v offset:layer_kv_offset atIndex:2];
+                    [enc setBuffer:bufAttn offset:0 atIndex:3];
+                    [enc setBytes:&n_heads length:sizeof(int) atIndex:4];
+                    [enc setBytes:&n_kv_heads length:sizeof(int) atIndex:5];
+                    [enc setBytes:&head_dim length:sizeof(int) atIndex:6];
+                    [enc setBytes:&kv_dim length:sizeof(int) atIndex:7];
+                    [enc setBytes:&total_seq length:sizeof(int) atIndex:8];
+                    [enc setBytes:&scale length:sizeof(float) atIndex:9];
+                    [enc setBytes:&window length:sizeof(int) atIndex:10];
+                    [enc setBytes:&q_pos_val length:sizeof(int) atIndex:11];
+                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                }
 
                 [enc endEncoding];
             }

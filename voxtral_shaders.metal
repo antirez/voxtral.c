@@ -444,6 +444,150 @@ kernel void decoder_attention_f16(
 }
 
 /* ========================================================================
+ * Split-KV single-token attention (flash-decoding).
+ *
+ * decoder_attention_f16 gives one threadgroup per query head, so a decode step
+ * with a long KV cache runs 32 threadgroups that each walk the whole cache
+ * serially, limiting GPU parallelism on long audio.
+ *
+ * These two kernels split the key range into n_splits chunks. The first pass
+ * runs one threadgroup per (head, chunk) and emits a partial softmax for its
+ * chunk: the running max, the running sum, and the unnormalised value
+ * accumulator. The second pass merges the chunks per head with the usual
+ * online-softmax rescaling. Results are identical to the serial kernel up to
+ * floating point association.
+ * ======================================================================== */
+
+kernel void decoder_attention_f16_split(
+    device const float *Q [[buffer(0)]],
+    device const half *K_cache [[buffer(1)]],
+    device const half *V_cache [[buffer(2)]],
+    device float *part_acc [[buffer(3)]],   /* [n_heads][n_splits][head_dim] */
+    device float *part_max [[buffer(4)]],   /* [n_heads][n_splits] */
+    device float *part_sum [[buffer(5)]],   /* [n_heads][n_splits] */
+    constant int &n_heads [[buffer(6)]],
+    constant int &n_kv_heads [[buffer(7)]],
+    constant int &head_dim [[buffer(8)]],
+    constant int &kv_dim [[buffer(9)]],
+    constant int &seq_k [[buffer(10)]],
+    constant float &scale [[buffer(11)]],
+    constant int &window_size [[buffer(12)]],
+    constant int &q_pos [[buffer(13)]],
+    constant int &n_splits [[buffer(14)]],
+    uint group_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    int head_idx = (int)group_idx / n_splits;
+    int split = (int)group_idx % n_splits;
+    if (head_idx >= n_heads) return;
+
+    int gqa_ratio = n_heads / n_kv_heads;
+    int kv_head = head_idx / gqa_ratio;
+
+    device const float *q_h = Q + head_idx * head_dim;
+
+    int valid_end = min(q_pos, seq_k - 1);
+    int valid_start = (window_size > 0) ? max(0, q_pos - window_size + 1) : 0;
+
+    /* Even split of the valid range across chunks. */
+    int total = valid_end - valid_start + 1;
+    int per = (total + n_splits - 1) / n_splits;
+    int j0 = valid_start + split * per;
+    int j1 = min(j0 + per - 1, valid_end);
+
+    int out_base = (head_idx * n_splits + split) * head_dim;
+
+    if (total <= 0 || j0 > valid_end) {
+        if (tid == 0) {
+            part_max[head_idx * n_splits + split] = -INFINITY;
+            part_sum[head_idx * n_splits + split] = 0.0f;
+        }
+        for (int d = (int)tid; d < head_dim; d += 32) part_acc[out_base + d] = 0.0f;
+        return;
+    }
+
+    int d0 = (int)tid;
+    int d1 = d0 + 32;
+    int d2 = d1 + 32;
+    int d3 = d2 + 32;
+
+    float q0 = (d0 < head_dim) ? q_h[d0] : 0.0f;
+    float q1 = (d1 < head_dim) ? q_h[d1] : 0.0f;
+    float q2 = (d2 < head_dim) ? q_h[d2] : 0.0f;
+    float q3 = (d3 < head_dim) ? q_h[d3] : 0.0f;
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    for (int j = j0; j <= j1; j++) {
+        device const half *k_j = K_cache + j * kv_dim + kv_head * head_dim;
+        float partial = q0 * float(k_j[d0]) + q1 * float(k_j[d1]) +
+                        q2 * float(k_j[d2]) + q3 * float(k_j[d3]);
+        float score = simd_sum(partial) * scale;
+
+        float old_max = running_max;
+        running_max = fmax(running_max, score);
+        float correction = exp(old_max - running_max);
+        float weight = exp(score - running_max);
+        running_sum = running_sum * correction + weight;
+        acc0 *= correction; acc1 *= correction;
+        acc2 *= correction; acc3 *= correction;
+
+        device const half *v_j = V_cache + j * kv_dim + kv_head * head_dim;
+        acc0 += weight * float(v_j[d0]);
+        acc1 += weight * float(v_j[d1]);
+        acc2 += weight * float(v_j[d2]);
+        acc3 += weight * float(v_j[d3]);
+    }
+
+    if (tid == 0) {
+        part_max[head_idx * n_splits + split] = running_max;
+        part_sum[head_idx * n_splits + split] = running_sum;
+    }
+    if (d0 < head_dim) part_acc[out_base + d0] = acc0;
+    if (d1 < head_dim) part_acc[out_base + d1] = acc1;
+    if (d2 < head_dim) part_acc[out_base + d2] = acc2;
+    if (d3 < head_dim) part_acc[out_base + d3] = acc3;
+}
+
+kernel void decoder_attention_combine(
+    device const float *part_acc [[buffer(0)]],
+    device const float *part_max [[buffer(1)]],
+    device const float *part_sum [[buffer(2)]],
+    device float *out [[buffer(3)]],
+    constant int &n_heads [[buffer(4)]],
+    constant int &head_dim [[buffer(5)]],
+    constant int &n_splits [[buffer(6)]],
+    uint head_idx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if ((int)head_idx >= n_heads) return;
+
+    float gmax = -INFINITY;
+    for (int s = 0; s < n_splits; s++)
+        gmax = fmax(gmax, part_max[head_idx * n_splits + s]);
+
+    float gsum = 0.0f;
+    for (int s = 0; s < n_splits; s++) {
+        float m = part_max[head_idx * n_splits + s];
+        if (isinf(m) && m < 0.0f) continue;
+        gsum += part_sum[head_idx * n_splits + s] * exp(m - gmax);
+    }
+    float inv = 1.0f / (gsum + 1e-10f);
+
+    for (int d = (int)tid; d < head_dim; d += 32) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_splits; s++) {
+            float m = part_max[head_idx * n_splits + s];
+            if (isinf(m) && m < 0.0f) continue;
+            acc += part_acc[(head_idx * n_splits + s) * head_dim + d] * exp(m - gmax);
+        }
+        out[head_idx * head_dim + d] = acc * inv;
+    }
+}
+
+/* ========================================================================
  * Q-tiled batched attention: one threadgroup per (head, query_block).
  * Processes ATTN_BQ queries per threadgroup, amortizing K/V memory reads.
  * Supports head_dim=64 (64 threads, 2 SIMD groups) and head_dim=128
